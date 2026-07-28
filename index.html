@@ -22,7 +22,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v3";
+const VER="v5";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -69,7 +69,7 @@ function App(){
     <div style={{height:"100%",background:"#000"}}>
       {screen==="home"&&<Home setScreen={setScreen}/>}
       {screen==="settings"&&<Settings {...{glowColor,setGlowColor,glowMax,setGlowMax,autoGlow,setAutoGlow,holdSec,setHoldSec,sens,setSens,gyroOn,setGyroOn,checkOn,setCheckOn,checkSec,setCheckSec,vol,setVol,showCam,setShowCam,setScreen}}/>}
-      {screen==="run"&&<Run {...{glowColor,glowMax,autoGlow,holdSec,sens,gyroOn,checkOn,checkSec,vol,showCam,setScreen}}/>}
+      {screen==="run"&&<Run {...{glowColor,setGlowColor,glowMax,setGlowMax,autoGlow,setAutoGlow,holdSec,setHoldSec,sens,setSens,gyroOn,setGyroOn,checkOn,setCheckOn,checkSec,setCheckSec,vol,setVol,showCam,setShowCam,setScreen}}/>}
     </div>
   );
 }
@@ -77,7 +77,7 @@ function App(){
 function Home({setScreen}){
   return (
     <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
-      <div style={{position:"absolute",top:14,left:16,fontSize:"13px",color:"#556",fontWeight:700}} className="mono">АНТИСОН {VER}</div>
+      <div style={{position:"absolute",top:14,left:16,fontSize:"20px",color:"#fff",fontWeight:900}} className="mono">АНТИСОН {VER}</div>
       <div style={{fontSize:"42px",marginBottom:"6px"}}>🛡</div>
       <div className="big" style={{fontSize:"32px",color:"#ff6b35",marginBottom:"8px",fontFamily:"'Courier New',monospace"}}>АНТИСОН</div>
       <div style={{fontSize:"14px",color:"#8a9bb0",lineHeight:1.6,marginBottom:"32px",maxWidth:"340px"}}>
@@ -124,9 +124,6 @@ function Settings(p){
       <Row label={"Сколько секунд без движения руля до первого писка: "+p.holdSec+" сек"}>
         <input type="range" min={1} max={8} value={p.holdSec} onChange={e=>p.setHoldSec(+e.target.value)}/>
       </Row>
-      <Row label={"Чувствительность к движению метки: "+p.sens.toFixed(2)}>
-        <input type="range" min={50} max={160} value={Math.round(p.sens*100)} onChange={e=>p.setSens(+e.target.value/100)}/>
-      </Row>
       <Row label={"Громкость тревоги: "+Math.round(p.vol*100)+"%"}>
         <input type="range" min={20} max={100} value={Math.round(p.vol*100)} onChange={e=>p.setVol(+e.target.value/100)}/>
       </Row>
@@ -161,6 +158,7 @@ function glowRGB(c){ return c==="white"?"255,255,255":c==="green"?"160,255,120":
 function Run(p){
   const [phase,setPhase]=useState("init"); // init|setzone|live|error
   const [err,setErr]=useState("");
+  const [showSet,setShowSet]=useState(false);
   const [hud,setHud]=useState(p.showCam);
   const [seeMark,setSeeMark]=useState(false);
   const [alarm,setAlarm]=useState(false);
@@ -177,7 +175,7 @@ function Run(p){
   const lastXRef=useRef(null),stillMsRef=useRef(0),lastTsRef=useRef(0);
   const thrRef=useRef(150),glowRef=useRef(p.glowMax),autoGlowRef=useRef(p.autoGlow),zoneRef=useRef(null);
   const stageRef=useRef(0);
-  const logRef=useRef([]),recRef=useRef(false);
+  const logRef=useRef([]),recRef=useRef(true);
   const checkTimerRef=useRef(0),checkArmedRef=useRef(false),checkDeadlineRef=useRef(0);
   const AW=64,AH=48;
 
@@ -266,28 +264,42 @@ function Run(p){
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
       // границы зоны (в пикселях анализа)
       const z=zoneRef.current;
-      const zx0=z?Math.floor(z.x0*AW):0, zy0=z?Math.floor(z.y0*AH):0, zx1=z?Math.ceil(z.x1*AW):AW, zy1=z?Math.ceil(z.y1*AH):AH;
+      const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+      const zx0=clamp(z?Math.floor(z.x0*AW):0,0,AW-1), zy0=clamp(z?Math.floor(z.y0*AH):0,0,AH-1);
+      const zx1=clamp(z?Math.ceil(z.x1*AW):AW,zx0+1,AW), zy1=clamp(z?Math.ceil(z.y1*AH):AH,zy0+1,AH);
       const zoneArea=Math.max(1,(zx1-zx0)*(zy1-zy0));
-      let n=0,sumX=0; const lums=[];
+      // первый проход: собрать яркости зоны, найти среднее и максимум
+      const lums=[];
+      if(img){
+        const d=img.data;
+        for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){
+          const i=(y*AW+x)*4; lums.push(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114);
+        }
+      }
+      let mean=0,mx=0;
+      if(lums.length){ let s=0; for(const l of lums){s+=l; if(l>mx)mx=l;} mean=s/lums.length; }
+      // УМНЫЙ ПОРОГ: метка = заметно светлее фона зоны (важен КОНТРАСТ, не абсолют).
+      let dynTh = mean + (mx-mean)*0.5;
+      dynTh = Math.max(mean+10, dynTh);           // минимум на 10 выше фона
+      dynTh = Math.min(dynTh, mx-2);              // но ниже самого яркого, чтобы метка попадала
+      if(!isFinite(dynTh)) dynTh = 150;           // страховка от NaN/пустой зоны
+      thrRef.current = thrRef.current*0.6 + dynTh*0.4;
+      if(!isFinite(thrRef.current)) thrRef.current = 150;
+      setAutoThr(Math.round(thrRef.current));
+      // второй проход: считаем метку по этому порогу
+      let n=0,sumX=0;
       if(img){
         const d=img.data;
         for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){
           const i=(y*AW+x)*4; const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
-          lums.push(lum);
-          if(lum>=thrRef.current*p.sens){n++;sumX+=x;}
+          if(lum>=thrRef.current){n++;sumX+=x;}
         }
       }
-      // адаптивный порог: держим так, чтобы метка была ~3-12% зоны (не пол-кадра)
-      if(lums.length){
-        const s=lums.slice().sort((a,b)=>a-b);
-        let th=s[Math.floor(s.length*0.94)]; // берём только самые яркие ~6%
-        th=Math.max(90,Math.min(250,th));
-        thrRef.current=thrRef.current*0.85+th*0.15;
-        setAutoThr(Math.round(thrRef.current));
-      }
       const frac=n/zoneArea;
-      // метка "хорошая" = видна, но не пол-зоны (иначе засветка/лицо в зоне)
-      const good=(n>=2 && frac<0.35);
+      // метка "хорошая": есть контрастное пятно, но не пол-зоны (иначе засветка).
+      // и сам контраст должен быть заметным (max заметно выше среднего).
+      const contrast=mx-mean;
+      const good=(n>=1 && frac<0.5 && contrast>8);
       setSeeMark(good);
 
       if(autoGlowRef.current){
@@ -324,7 +336,7 @@ function Run(p){
         if(z){ vc.strokeStyle="rgba(0,232,122,0.7)";vc.lineWidth=2;vc.strokeRect(z.x0*VW,z.y0*VH,(z.x1-z.x0)*VW,(z.y1-z.y0)*VH); }
         if(img && good){
           vc.fillStyle="rgba(0,232,255,0.5)";const sx=VW/AW,sy=VH/AH,d=img.data;
-          for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){const i=(y*AW+x)*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;if(lum>=thrRef.current*p.sens){vc.fillRect(x*sx,y*sy,sx,sy);}}
+          for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){const i=(y*AW+x)*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;if(lum>=thrRef.current){vc.fillRect(x*sx,y*sy,sx,sy);}}
           const gx=(zx0+(sumX/n-zx0));
           vc.strokeStyle="#ff6b35";vc.lineWidth=3;vc.beginPath();vc.moveTo((sumX/n/AW)*VW,z.y0*VH);vc.lineTo((sumX/n/AW)*VW,z.y1*VH);vc.stroke();
         }
@@ -361,13 +373,13 @@ function Run(p){
 
     {/* ---- экран обводки зоны ---- */}
     {phase==="setzone"&&(
-    <div style={{height:"100%",background:"#000",display:"flex",flexDirection:"column",padding:"12px"}}>
+    <div style={{height:"100%",background:"#000",display:"flex",flexDirection:"column",padding:"12px",justifyContent:"center"}}>
       <div style={{fontSize:"15px",color:"#fff",fontWeight:700,marginBottom:"8px",textAlign:"center"}}>Обведи пальцем зону руля</div>
       <div style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"10px",textAlign:"center"}}>Проведи пальцем прямоугольник вокруг руля / метки. Камера будет смотреть только туда.</div>
       <canvas ref={setupRef} width={320} height={240}
         onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
         onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp}
-        style={{width:"100%",flex:1,borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",background:"#000",touchAction:"none",objectFit:"cover"}}/>
+        style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",background:"#000",touchAction:"none",display:"block"}}/>
       <div style={{display:"flex",gap:"8px",marginTop:"12px"}}>
         <button onClick={resetZone} style={{flex:1,padding:"14px",borderRadius:"12px",border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4",fontSize:"15px",fontWeight:700}}>↺ Заново</button>
         <button onClick={confirmZone} disabled={!zone} style={{flex:2,padding:"14px",borderRadius:"12px",border:"1px solid #00e87a",background:zone?"linear-gradient(135deg,#0f401b,#1c6e32)":"rgba(20,24,34,0.5)",color:zone?"#8cffbe":"#556",fontSize:"16px",fontWeight:800}}>✓ Готово, начать</button>
@@ -379,8 +391,8 @@ function Run(p){
     <div style={{height:"100%",position:"relative",background:"#000",overflow:"hidden"}} onClick={()=>{if(!hud)tapCheck();}}>
 
       <div style={{position:"absolute",top:12,left:14,zIndex:5}}>
-        <div className="mono" style={{fontSize:"15px",fontWeight:800,color:"#fff"}}>АНТИСОН {VER}</div>
-        <div style={{fontSize:"12px",color:seeMark?"#00e87a":"#ffb84a",marginTop:"2px"}}>{seeMark?"✓ метку вижу":"⋯ ищу метку"}</div>
+        <div className="mono" style={{fontSize:"20px",fontWeight:900,color:"#fff"}}>АНТИСОН {VER}</div>
+        <div style={{fontSize:"17px",fontWeight:800,color:seeMark?"#00e87a":"#ffb84a",marginTop:"3px"}}>{seeMark?"✓ метку вижу":"⋯ ищу метку"}</div>
       </div>
       <div style={{position:"absolute",top:12,right:14,zIndex:5,textAlign:"right"}}>
         <div className="mono" style={{fontSize:"22px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"}<span style={{fontSize:"11px",color:"#8a9bb0"}}> mph</span></div>
@@ -389,8 +401,8 @@ function Run(p){
 
       {hud?(
         <div style={{position:"absolute",top:"60px",left:"12px",right:"12px",zIndex:4}}>
-          <canvas ref={viewRef} width={320} height={240} style={{width:"100%",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
-          <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginTop:"6px",textAlign:"center"}}>порог:{autoThr} · свет:{Math.round(glowNow*100)}% · лог:{recN}</div>
+          <canvas ref={viewRef} width={320} height={240} style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
+          <div className="mono" style={{fontSize:"15px",color:"#a8b4c4",marginTop:"8px",textAlign:"center"}}>порог:{autoThr} · свет:{Math.round(glowNow*100)}% · лог:{recN}</div>
         </div>
       ):(
         <div style={{position:"absolute",top:0,left:0,right:0,bottom:"33%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:2}}>
@@ -419,11 +431,21 @@ function Run(p){
 
       <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"10px 12px 16px",display:"flex",gap:"8px"}}>
         <button onClick={(e)=>{e.stopPropagation();setHud(!hud);}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>{hud?"🌙 Спрятать":"👁 Показать"}</button>
-        <button onClick={(e)=>{e.stopPropagation();toggleRec();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:recRef.current?"1px solid #00e87a":"1px solid rgba(255,255,255,0.2)",background:recRef.current?"rgba(0,232,122,0.15)":"rgba(20,24,34,0.9)",color:recRef.current?"#8cffbe":"#c0c8d4"}}>{recRef.current?"● "+recN:"◉ Запись"}</button>
+        <button onClick={(e)=>{e.stopPropagation();setShowSet(true);}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⚙ Настр.</button>
         <button onClick={(e)=>{e.stopPropagation();download();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог</button>
         <button onClick={(e)=>{e.stopPropagation();stopAll();p.setScreen("home");}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
       </div>
     </div>
+    )}
+    {showSet&&(
+      <div style={{position:"absolute",inset:0,zIndex:50,background:"#0a0d14",overflowY:"auto"}}>
+        <Settings glowColor={p.glowColor} setGlowColor={p.setGlowColor} glowMax={p.glowMax} setGlowMax={p.setGlowMax}
+          autoGlow={p.autoGlow} setAutoGlow={p.setAutoGlow} holdSec={p.holdSec} setHoldSec={p.setHoldSec}
+          sens={p.sens} setSens={p.setSens} gyroOn={p.gyroOn} setGyroOn={p.setGyroOn}
+          checkOn={p.checkOn} setCheckOn={p.setCheckOn} checkSec={p.checkSec} setCheckSec={p.setCheckSec}
+          vol={p.vol} setVol={p.setVol} showCam={p.showCam} setShowCam={(v)=>{p.setShowCam(v);setHud(v);}}
+          setScreen={()=>setShowSet(false)}/>
+      </div>
     )}
    </React.Fragment>
   );
