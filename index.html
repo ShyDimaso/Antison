@@ -22,7 +22,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v2";
+const VER="v3";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -204,7 +204,6 @@ function Run(p){
       streamRef.current=s;
       if(videoRef.current){videoRef.current.srcObject=s;await videoRef.current.play().catch(()=>{});}
       setPhase("setzone"); // сначала просим обвести зону руля
-      drawSetup();
     }catch(e){ setErr((e&&e.name?e.name+": ":"")+(e&&e.message||String(e))); setPhase("error"); }
   };
   const stopAll=()=>{cancelAnimationFrame(rafRef.current);clearTimeout(checkTimerRef.current);if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}};
@@ -212,39 +211,37 @@ function Run(p){
   useEffect(()=>{glowRef.current=p.glowMax;setGlowNow(p.glowMax);},[p.glowMax]);
   useEffect(()=>{autoGlowRef.current=p.autoGlow;},[p.autoGlow]);
 
-  // ---- экран настройки зоны: показываем видео, рисуем прямоугольник пальцем ----
-  const setupDraw=useRef(0);
-  const drawSetup=()=>{
-    const v=videoRef.current,c=setupRef.current;
-    if(v&&c&&v.readyState>=2){
-      const ctx=c.getContext("2d"),W=c.width,H=c.height;
-      ctx.drawImage(v,0,0,W,H);
-      const z=drawing||zone;
-      // затемнить всё вне зоны
-      ctx.fillStyle="rgba(0,0,0,0.55)";
-      if(z){
-        const x0=z.x0*W,y0=z.y0*H,x1=z.x1*W,y1=z.y1*H;
-        const rx=Math.min(x0,x1),ry=Math.min(y0,y1),rw=Math.abs(x1-x0),rh=Math.abs(y1-y0);
-        ctx.fillRect(0,0,W,ry); ctx.fillRect(0,ry+rh,W,H-(ry+rh));
-        ctx.fillRect(0,ry,rx,rh); ctx.fillRect(rx+rw,ry,W-(rx+rw),rh);
-        ctx.strokeStyle="#00e87a";ctx.lineWidth=3;ctx.strokeRect(rx,ry,rw,rh);
-        ctx.fillStyle="rgba(0,232,122,0.9)";ctx.font="bold 13px sans-serif";
-        ctx.fillText("зона руля",rx+6,ry+18);
-      }else{
-        ctx.fillRect(0,0,W,H);
-        ctx.fillStyle="#fff";ctx.font="bold 16px sans-serif";ctx.textAlign="center";
-        ctx.fillText("Обведи пальцем зону руля",W/2,H/2);ctx.textAlign="left";
+  // ---- экран настройки зоны: рисуем кадр видео в canvas + рамку поверх ----
+  useEffect(()=>{
+    if(phase!=="setzone")return;
+    let raf;
+    const draw=()=>{
+      const c=setupRef.current, v=videoRef.current;
+      if(c){
+        const ctx=c.getContext("2d"),W=c.width,H=c.height;
+        if(v&&v.readyState>=2){ ctx.drawImage(v,0,0,W,H); }
+        else { ctx.fillStyle="#111";ctx.fillRect(0,0,W,H);ctx.fillStyle="#8a9bb0";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("камера запускается…",W/2,H/2);ctx.textAlign="left"; }
+        const z=drawing||zone;
+        if(z){
+          const x0=Math.min(z.x0,z.x1)*W,y0=Math.min(z.y0,z.y1)*H,rw=Math.abs(z.x1-z.x0)*W,rh=Math.abs(z.y1-z.y0)*H;
+          ctx.fillStyle="rgba(0,0,0,0.5)";
+          ctx.fillRect(0,0,W,y0); ctx.fillRect(0,y0+rh,W,H-(y0+rh));
+          ctx.fillRect(0,y0,x0,rh); ctx.fillRect(x0+rw,y0,W-(x0+rw),rh);
+          ctx.strokeStyle="#00e87a";ctx.lineWidth=3;ctx.strokeRect(x0,y0,rw,rh);
+          ctx.fillStyle="#00e87a";ctx.font="bold 14px sans-serif";ctx.fillText("зона руля",x0+6,y0+20);
+        }
       }
-    }
-    setupDraw.current=requestAnimationFrame(drawSetup);
-  };
+      raf=requestAnimationFrame(draw);
+    };
+    raf=requestAnimationFrame(draw);
+    return()=>cancelAnimationFrame(raf);
+  },[phase,drawing,zone]);
   const evtToNorm=(e,el)=>{const r=el.getBoundingClientRect();const t=e.touches?e.touches[0]:e;return{x:(t.clientX-r.left)/r.width,y:(t.clientY-r.top)/r.height};};
   const onDown=(e)=>{const pt=evtToNorm(e,setupRef.current);setDrawing({x0:pt.x,y0:pt.y,x1:pt.x,y1:pt.y});};
   const onMove=(e)=>{if(!drawing)return;const pt=evtToNorm(e,setupRef.current);setDrawing(d=>({...d,x1:pt.x,y1:pt.y}));};
   const onUp=()=>{ if(drawing){ const z={x0:Math.min(drawing.x0,drawing.x1),y0:Math.min(drawing.y0,drawing.y1),x1:Math.max(drawing.x0,drawing.x1),y1:Math.max(drawing.y0,drawing.y1)}; if((z.x1-z.x0)>0.05&&(z.y1-z.y0)>0.05){setZone(z);zoneRef.current=z;} setDrawing(null); } };
 
   const confirmZone=()=>{
-    cancelAnimationFrame(setupDraw.current);
     setPhase("live"); lastTsRef.current=Date.now(); armCheck(); loop();
   };
   const resetZone=()=>{setZone(null);zoneRef.current=null;};
@@ -349,36 +346,37 @@ function Run(p){
 
   const rgb=glowRGB(p.glowColor);
 
-  if(phase==="error") return (
+  return (
+   <React.Fragment>
+    <video ref={videoRef} playsInline muted autoPlay style={{display:"none"}}/>
+    <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
+
+    {phase==="error"&&(
     <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
       <div style={{color:"#ff6666",fontSize:"15px",marginBottom:"10px"}}>Камера не открылась</div>
       <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"16px"}}>{err}</div>
       <button onClick={()=>p.setScreen("home")} style={{padding:"12px 20px",borderRadius:"12px",border:"1px solid #4a9eff",background:"rgba(74,158,255,0.12)",color:"#9fcfff"}}>Назад</button>
     </div>
-  );
+    )}
 
-  // ---- экран обводки зоны ----
-  if(phase==="setzone") return (
+    {/* ---- экран обводки зоны ---- */}
+    {phase==="setzone"&&(
     <div style={{height:"100%",background:"#000",display:"flex",flexDirection:"column",padding:"12px"}}>
       <div style={{fontSize:"15px",color:"#fff",fontWeight:700,marginBottom:"8px",textAlign:"center"}}>Обведи пальцем зону руля</div>
       <div style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"10px",textAlign:"center"}}>Проведи пальцем прямоугольник вокруг руля / метки. Камера будет смотреть только туда.</div>
-      <video ref={videoRef} playsInline muted style={{display:"none"}}/>
-      <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
       <canvas ref={setupRef} width={320} height={240}
         onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
         onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp}
-        style={{width:"100%",flex:1,borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",background:"#000",touchAction:"none"}}/>
+        style={{width:"100%",flex:1,borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",background:"#000",touchAction:"none",objectFit:"cover"}}/>
       <div style={{display:"flex",gap:"8px",marginTop:"12px"}}>
         <button onClick={resetZone} style={{flex:1,padding:"14px",borderRadius:"12px",border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4",fontSize:"15px",fontWeight:700}}>↺ Заново</button>
         <button onClick={confirmZone} disabled={!zone} style={{flex:2,padding:"14px",borderRadius:"12px",border:"1px solid #00e87a",background:zone?"linear-gradient(135deg,#0f401b,#1c6e32)":"rgba(20,24,34,0.5)",color:zone?"#8cffbe":"#556",fontSize:"16px",fontWeight:800}}>✓ Готово, начать</button>
       </div>
     </div>
-  );
+    )}
 
-  return (
+    {phase==="live"&&(
     <div style={{height:"100%",position:"relative",background:"#000",overflow:"hidden"}} onClick={()=>{if(!hud)tapCheck();}}>
-      <video ref={videoRef} playsInline muted style={{display:"none"}}/>
-      <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
 
       <div style={{position:"absolute",top:12,left:14,zIndex:5}}>
         <div className="mono" style={{fontSize:"15px",fontWeight:800,color:"#fff"}}>АНТИСОН {VER}</div>
@@ -426,6 +424,8 @@ function Run(p){
         <button onClick={(e)=>{e.stopPropagation();stopAll();p.setScreen("home");}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
       </div>
     </div>
+    )}
+   </React.Fragment>
   );
 }
 
