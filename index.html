@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<meta name="theme-color" content="#000000"/>
+<title>Антисон</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{height:100%;background:#000;color:#f0f4f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;overflow:hidden;overscroll-behavior:none;}
+  #app{height:100%;}
+  button{font-family:inherit;cursor:pointer;}
+  input[type=range]{width:100%;height:34px;}
+  .big{font-size:20px;font-weight:800;letter-spacing:1px;}
+  .mono{font-family:'Courier New',monospace;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel">
+const {useState,useRef,useEffect}=React;
+const VER="v1";
+
+/* ============================================================
+   АНТИСОН — автономный детектор засыпания.
+   Без интернета, без ИИ, без навигации. Локально на телефоне.
+   Камера следит за яркой меткой на руле (скотч/пластырь/рука).
+   Метка замерла -> мягкая эскалация -> тревога.
+   Гироскоп ловит резкий увод из полосы (отдельный сигнал).
+   ============================================================ */
+
+// звук через WebAudio (без файлов)
+let AC=null;
+function beep(freq,ms,vol){
+  try{
+    AC=AC||new (window.AudioContext||window.webkitAudioContext)();
+    if(AC.state==="suspended")AC.resume();
+    const o=AC.createOscillator(),g=AC.createGain();
+    o.type="sine";o.frequency.value=freq;
+    g.gain.value=vol==null?0.3:vol;
+    o.connect(g);g.connect(AC.destination);
+    o.start();o.stop(AC.currentTime+ms/1000);
+  }catch(e){}
+}
+function siren(times,vol){
+  let i=0;const id=setInterval(()=>{beep(i%2?1200:800,220,vol==null?0.6:vol);i++;if(i>=times*2)clearInterval(id);},260);
+}
+
+function App(){
+  const [screen,setScreen]=useState("home"); // home|settings|run
+  // ---- настройки (localStorage) ----
+  const load=(k,d)=>{try{const v=localStorage.getItem("as_"+k);return v==null?d:JSON.parse(v);}catch(e){return d;}};
+  const [glowColor,setGlowColor]=useState(load("glowColor","amber")); // amber|white|green
+  const [glowMax,setGlowMax]=useState(load("glowMax",0.6));
+  const [autoGlow,setAutoGlow]=useState(load("autoGlow",true));
+  const [holdSec,setHoldSec]=useState(load("holdSec",3));      // сек без движения -> писк
+  const [sens,setSens]=useState(load("sens",1.0));
+  const [gyroOn,setGyroOn]=useState(load("gyroOn",true));
+  const [checkOn,setCheckOn]=useState(load("checkOn",true));   // кнопка бдительности
+  const [checkSec,setCheckSec]=useState(load("checkSec",45));  // интервал чека
+  const [vol,setVol]=useState(load("vol",0.6));
+  const [showCam,setShowCam]=useState(load("showCam",true));   // показывать видео (тест) / прятать
+  useEffect(()=>{const s={glowColor,glowMax,autoGlow,holdSec,sens,gyroOn,checkOn,checkSec,vol,showCam};for(const k in s){try{localStorage.setItem("as_"+k,JSON.stringify(s[k]));}catch(e){}}},[glowColor,glowMax,autoGlow,holdSec,sens,gyroOn,checkOn,checkSec,vol,showCam]);
+
+  return (
+    <div style={{height:"100%",background:"#000"}}>
+      {screen==="home"&&<Home setScreen={setScreen}/>}
+      {screen==="settings"&&<Settings {...{glowColor,setGlowColor,glowMax,setGlowMax,autoGlow,setAutoGlow,holdSec,setHoldSec,sens,setSens,gyroOn,setGyroOn,checkOn,setCheckOn,checkSec,setCheckSec,vol,setVol,showCam,setShowCam,setScreen}}/>}
+      {screen==="run"&&<Run {...{glowColor,glowMax,autoGlow,holdSec,sens,gyroOn,checkOn,checkSec,vol,showCam,setScreen}}/>}
+    </div>
+  );
+}
+
+function Home({setScreen}){
+  return (
+    <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
+      <div style={{position:"absolute",top:14,left:16,fontSize:"13px",color:"#556",fontWeight:700}} className="mono">АНТИСОН {VER}</div>
+      <div style={{fontSize:"42px",marginBottom:"6px"}}>🛡</div>
+      <div className="big" style={{fontSize:"32px",color:"#ff6b35",marginBottom:"8px",fontFamily:"'Courier New',monospace"}}>АНТИСОН</div>
+      <div style={{fontSize:"14px",color:"#8a9bb0",lineHeight:1.6,marginBottom:"32px",maxWidth:"340px"}}>
+        Не даёт заснуть за рулём. Камера следит за меткой на руле. Работает без интернета.
+      </div>
+      <button onClick={()=>setScreen("run")} style={{width:"100%",maxWidth:"360px",padding:"20px",borderRadius:"16px",border:"1px solid #00e87a",background:"linear-gradient(135deg,#0f401b,#1c6e32)",color:"#8cffbe",fontSize:"20px",fontWeight:800,marginBottom:"12px"}}>▶ СТАРТ</button>
+      <button onClick={()=>setScreen("settings")} style={{width:"100%",maxWidth:"360px",padding:"16px",borderRadius:"14px",border:"1px solid rgba(255,255,255,0.15)",background:"rgba(20,24,34,0.8)",color:"#c0c8d4",fontSize:"16px",fontWeight:600}}>⚙ Настройки</button>
+      <div style={{fontSize:"11px",color:"#445",marginTop:"28px",lineHeight:1.5,maxWidth:"320px"}}>
+        Наклей полоску белого скотча или пластыря на обод руля, чтобы камера видела метку. Первый раз проверь стоя.
+      </div>
+    </div>
+  );
+}
+
+function Row({label,children}){
+  return <div style={{marginBottom:"18px"}}><div style={{fontSize:"13px",color:"#8a9bb0",marginBottom:"6px"}}>{label}</div>{children}</div>;
+}
+function Seg({options,value,onChange}){
+  return <div style={{display:"flex",gap:"6px"}}>{options.map(([k,l])=>(
+    <button key={k} onClick={()=>onChange(k)} style={{flex:1,padding:"11px 6px",borderRadius:"10px",fontSize:"13px",fontWeight:600,border:value===k?"1px solid #ff6b35":"1px solid rgba(255,255,255,0.12)",background:value===k?"rgba(255,107,53,0.16)":"rgba(20,24,34,0.8)",color:value===k?"#ffb08a":"#8a9bb0"}}>{l}</button>
+  ))}</div>;
+}
+
+function Settings(p){
+  return (
+    <div style={{height:"100%",overflowY:"auto",padding:"18px",paddingBottom:"40px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"18px"}}>
+        <div className="big" style={{fontSize:"20px",color:"#ff6b35"}}>⚙ Настройки</div>
+        <button onClick={()=>p.setScreen("home")} style={{background:"rgba(255,255,255,0.1)",border:"none",color:"#fff",borderRadius:"10px",padding:"8px 16px",fontSize:"15px"}}>✕</button>
+      </div>
+
+      <Row label="Цвет подсветки метки (янтарный щадит ночное зрение)">
+        <Seg options={[["amber","Янтарный"],["white","Белый"],["green","Салатовый"]]} value={p.glowColor} onChange={p.setGlowColor}/>
+      </Row>
+      <Row label={"Яркость подсветки: "+Math.round(p.glowMax*100)+"%"}>
+        <input type="range" min={10} max={100} value={Math.round(p.glowMax*100)} onChange={e=>p.setGlowMax(+e.target.value/100)}/>
+      </Row>
+      <Row label="Авто-яркость (сама поднимается, пока не увидит метку)">
+        <Seg options={[[true,"Вкл"],[false,"Выкл"]]} value={p.autoGlow} onChange={p.setAutoGlow}/>
+      </Row>
+
+      <div style={{height:"1px",background:"rgba(255,255,255,0.08)",margin:"6px 0 18px"}}/>
+
+      <Row label={"Сколько секунд без движения руля до первого писка: "+p.holdSec+" сек"}>
+        <input type="range" min={1} max={8} value={p.holdSec} onChange={e=>p.setHoldSec(+e.target.value)}/>
+      </Row>
+      <Row label={"Чувствительность к движению метки: "+p.sens.toFixed(2)}>
+        <input type="range" min={50} max={160} value={Math.round(p.sens*100)} onChange={e=>p.setSens(+e.target.value/100)}/>
+      </Row>
+      <Row label={"Громкость тревоги: "+Math.round(p.vol*100)+"%"}>
+        <input type="range" min={20} max={100} value={Math.round(p.vol*100)} onChange={e=>p.setVol(+e.target.value/100)}/>
+      </Row>
+
+      <div style={{height:"1px",background:"rgba(255,255,255,0.08)",margin:"6px 0 18px"}}/>
+
+      <Row label="Гироскоп: сигнал при резком уводе из полосы">
+        <Seg options={[[true,"Вкл"],[false,"Выкл"]]} value={p.gyroOn} onChange={p.setGyroOn}/>
+      </Row>
+      <Row label="Кнопка бдительности (периодически тапни экран)">
+        <Seg options={[[true,"Вкл"],[false,"Выкл"]]} value={p.checkOn} onChange={p.setCheckOn}/>
+      </Row>
+      {p.checkOn&&<Row label={"Интервал проверки: "+p.checkSec+" сек"}>
+        <input type="range" min={20} max={90} value={p.checkSec} onChange={e=>p.setCheckSec(+e.target.value)}/>
+      </Row>}
+
+      <div style={{height:"1px",background:"rgba(255,255,255,0.08)",margin:"6px 0 18px"}}/>
+
+      <Row label="Показывать видео с камеры (для теста) или прятать в рабочий режим">
+        <Seg options={[[true,"Показывать"],[false,"Прятать"]]} value={p.showCam} onChange={p.setShowCam}/>
+      </Row>
+
+      <div style={{fontSize:"11px",color:"#556",lineHeight:1.5,marginTop:"10px"}}>
+        Версия {VER}. Всё работает локально, без интернета. Тревога — не разрешение спать. Устал — съезжай и спи.
+      </div>
+    </div>
+  );
+}
+
+function glowRGB(c){ return c==="white"?"255,255,255":c==="green"?"160,255,120":"255,190,110"; } // amber default
+
+function Run(p){
+  const T=(x)=>x;
+  const [phase,setPhase]=useState("init"); // init|live|error
+  const [err,setErr]=useState("");
+  const [hud,setHud]=useState(p.showCam);   // показывать HUD/видео
+  const [seeMark,setSeeMark]=useState(false);
+  const [alarm,setAlarm]=useState(false);
+  const [checkNow,setCheckNow]=useState(false);
+  const [autoThr,setAutoThr]=useState(150);
+  const [glowNow,setGlowNow]=useState(p.glowMax);
+  const [spd,setSpd]=useState(null);
+  const [clock,setClock]=useState("");
+  const [recN,setRecN]=useState(0);
+
+  const videoRef=useRef(null),rawRef=useRef(null),viewRef=useRef(null),streamRef=useRef(null),rafRef=useRef(0);
+  const lastXRef=useRef(null),stillMsRef=useRef(0),lastTsRef=useRef(0);
+  const thrRef=useRef(150),glowRef=useRef(p.glowMax),autoGlowRef=useRef(p.autoGlow);
+  const stageRef=useRef(0); // 0 ок, 1 писк, 2 тук-тук, 3 тревога
+  const logRef=useRef([]),recRef=useRef(false);
+  const gyroLastRef=useRef(null);
+  const checkTimerRef=useRef(0),checkArmedRef=useRef(false),checkDeadlineRef=useRef(0);
+  const AW=64,AH=48,MAXBLOB=Math.round(AW*AH*0.30);
+
+  // часы
+  useEffect(()=>{const id=setInterval(()=>{const d=new Date();setClock(d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));},1000);return()=>clearInterval(id);},[]);
+
+  // GPS скорость (для красоты, локально)
+  useEffect(()=>{
+    let wid=null;
+    try{ if(navigator.geolocation){ wid=navigator.geolocation.watchPosition(pos=>{ if(pos.coords.speed!=null&&pos.coords.speed>=0) setSpd(Math.round(pos.coords.speed*2.23694)); },()=>{},{enableHighAccuracy:true,maximumAge:1000}); } }catch(e){}
+    return()=>{try{if(wid!=null)navigator.geolocation.clearWatch(wid);}catch(e){}};
+  },[]);
+
+  // гироскоп: резкий увод
+  useEffect(()=>{
+    if(!p.gyroOn)return;
+    const onMot=(e)=>{
+      const r=e.rotationRate||{}; const yaw=Math.abs(r.alpha||0);
+      // резкий манёвр = большой всплеск рыскания
+      if(yaw>90){ // порог "перестройка/увод" (подберём на тестах)
+        if(recRef.current)logRef.current.push({t:Date.now(),ev:"GYRO_SWERVE",yaw:+yaw.toFixed(0)});
+        beep(700,120,p.vol*0.5);
+      }
+    };
+    let need=false;
+    const arm=async()=>{
+      try{ if(typeof DeviceMotionEvent!=="undefined"&&typeof DeviceMotionEvent.requestPermission==="function"){ await DeviceMotionEvent.requestPermission(); } }catch(e){}
+      window.addEventListener("devicemotion",onMot);
+    };
+    arm();
+    return()=>window.removeEventListener("devicemotion",onMot);
+  },[p.gyroOn,p.vol]);
+
+  const startCam=async()=>{
+    setErr("");
+    try{
+      const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:320},height:{ideal:240}},audio:false});
+      streamRef.current=s;
+      if(videoRef.current){videoRef.current.srcObject=s;await videoRef.current.play().catch(()=>{});}
+      setPhase("live"); lastTsRef.current=Date.now(); armCheck(); loop();
+    }catch(e){ setErr((e&&e.name?e.name+": ":"")+(e&&e.message||String(e))); setPhase("error"); }
+  };
+  const stopAll=()=>{cancelAnimationFrame(rafRef.current);clearTimeout(checkTimerRef.current);if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}};
+  useEffect(()=>{startCam();return()=>stopAll();},[]);
+  useEffect(()=>{glowRef.current=p.glowMax;setGlowNow(p.glowMax);},[p.glowMax]);
+  useEffect(()=>{autoGlowRef.current=p.autoGlow;},[p.autoGlow]);
+
+  // кнопка бдительности
+  const armCheck=()=>{
+    if(!p.checkOn)return;
+    clearTimeout(checkTimerRef.current);
+    checkTimerRef.current=setTimeout(()=>{
+      checkArmedRef.current=true; checkDeadlineRef.current=Date.now()+6000; setCheckNow(true);
+      beep(1000,200,p.vol*0.5);
+    },p.checkSec*1000);
+  };
+  const tapCheck=()=>{
+    if(checkArmedRef.current){ checkArmedRef.current=false; setCheckNow(false); armCheck(); if(recRef.current)logRef.current.push({t:Date.now(),ev:"CHECK_OK"}); }
+    if(alarm){ setAlarm(false); stageRef.current=0; stillMsRef.current=0; }
+  };
+
+  const loop=()=>{
+    const v=videoRef.current,raw=rawRef.current;
+    if(!v||!raw){rafRef.current=requestAnimationFrame(loop);return;}
+    const now=Date.now(); const dt=now-(lastTsRef.current||now); lastTsRef.current=now;
+    if(v.readyState>=2){
+      const rc=raw.getContext("2d",{willReadFrequently:true});
+      rc.drawImage(v,0,0,AW,AH);
+      let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
+      let n=0,sumX=0,mx=0; const lums=[];
+      if(img){
+        const d=img.data;
+        for(let idx=0;idx<AW*AH;idx++){
+          const i=idx*4; const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+          lums.push(lum);
+          if(lum>=thrRef.current*p.sens){n++;sumX+=(idx%AW);}
+          if(lum>mx)mx=lum;
+        }
+      }
+      // адаптивный порог: 88-й процентиль яркости (против засветки фарами)
+      if(lums.length){ const s=lums.slice().sort((a,b)=>a-b); let th=s[Math.floor(s.length*0.88)]; th=Math.max(60,Math.min(245,th)); thrRef.current=thrRef.current*0.9+th*0.1; setAutoThr(Math.round(thrRef.current)); }
+      const tooBig=n>MAXBLOB; const good=(n>=3&&!tooBig);
+      setSeeMark(good);
+      // авто-подсветка: не видим метку -> поднимаем свечение к максимуму; видим -> держим минимально нужное
+      if(autoGlowRef.current){
+        let g=glowRef.current;
+        if(!good) g=Math.min(p.glowMax, g+0.03); else g=Math.max(p.glowMax*0.4, g-0.02);
+        glowRef.current=g; setGlowNow(g);
+      }
+      let normX=lastXRef.current==null?0.5:lastXRef.current;
+      if(good)normX=(sumX/n)/AW;
+      const mv=(lastXRef.current==null)?0:Math.abs(normX-lastXRef.current);
+      lastXRef.current=normX;
+
+      // эскалация по неподвижности
+      const moving=mv>0.012; // порог "шевельнулась метка"
+      if(good){
+        if(moving){ stillMsRef.current=0; if(stageRef.current>0){stageRef.current=0;setAlarm(false);} }
+        else{ stillMsRef.current+=dt; }
+        const s=stillMsRef.current/1000;
+        if(s>=p.holdSec && stageRef.current<1){ stageRef.current=1; beep(900,160,p.vol*0.5); if(recRef.current)logRef.current.push({t:now,ev:"BEEP1"}); }
+        if(s>=p.holdSec+2 && stageRef.current<2){ stageRef.current=2; beep(1100,150,p.vol*0.6); setTimeout(()=>beep(1100,150,p.vol*0.6),200); if(recRef.current)logRef.current.push({t:now,ev:"TUKTUK"}); }
+        if(s>=p.holdSec+4 && stageRef.current<3){ stageRef.current=3; setAlarm(true); siren(6,p.vol); if(recRef.current)logRef.current.push({t:now,ev:"ALARM"}); }
+      }else{
+        // метку не видим — не наказываем (может свет плохой), сбрасываем таймер медленнее
+        stillMsRef.current=Math.max(0,stillMsRef.current-dt*0.5);
+      }
+
+      // просрочен чек бдительности -> тревога
+      if(checkArmedRef.current && Date.now()>checkDeadlineRef.current && !alarm){ setAlarm(true); siren(6,p.vol); if(recRef.current)logRef.current.push({t:now,ev:"CHECK_MISS"}); }
+
+      // рисуем HUD (если показываем)
+      const view=viewRef.current;
+      if(hud && view){
+        const vc=view.getContext("2d"),VW=view.width,VH=view.height;
+        vc.drawImage(v,0,0,VW,VH);
+        if(img && !tooBig){
+          vc.fillStyle="rgba(0,232,255,0.5)";const sx=VW/AW,sy=VH/AH,d=img.data;
+          for(let idx=0;idx<AW*AH;idx++){const i=idx*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;if(lum>=thrRef.current*p.sens){vc.fillRect((idx%AW)*sx,Math.floor(idx/AW)*sy,sx,sy);}}
+        }
+        if(good){vc.strokeStyle="#ff6b35";vc.lineWidth=3;vc.beginPath();vc.moveTo(normX*VW,0);vc.lineTo(normX*VW,VH);vc.stroke();}
+      }
+
+      if(recRef.current){ logRef.current.push({t:now,x:+normX.toFixed(4),mv:+mv.toFixed(4),n:tooBig?-1:n,thr:Math.round(thrRef.current),stage:stageRef.current}); setRecN(logRef.current.length); }
+    }
+    rafRef.current=requestAnimationFrame(()=>setTimeout(loop,110));
+  };
+
+  const toggleRec=()=>{ recRef.current=!recRef.current; if(recRef.current){logRef.current=[];setRecN(0);} };
+  const download=()=>{
+    const out={meta:{app:"Antison",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,holdSec:p.holdSec,sens:p.sens,glowColor:p.glowColor,samples:logRef.current.length},rows:logRef.current};
+    const blob=new Blob([JSON.stringify(out,null,1)],{type:"application/json"});
+    const url=URL.createObjectURL(blob),a=document.createElement("a");
+    a.href=url;a.download="antison_"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
+    document.body.appendChild(a);a.click();setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},400);
+  };
+
+  const rgb=glowRGB(p.glowColor);
+
+  if(phase==="error") return (
+    <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
+      <div style={{color:"#ff6666",fontSize:"15px",marginBottom:"10px"}}>Камера не открылась</div>
+      <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"16px"}}>{err}</div>
+      <div style={{fontSize:"13px",color:"#8a9bb0",marginBottom:"20px",maxWidth:"320px",lineHeight:1.5}}>Нужен HTTPS и разрешение на камеру. Открывай через github.io или https.</div>
+      <button onClick={()=>p.setScreen("home")} style={{padding:"12px 20px",borderRadius:"12px",border:"1px solid #4a9eff",background:"rgba(74,158,255,0.12)",color:"#9fcfff"}}>Назад</button>
+    </div>
+  );
+
+  return (
+    <div style={{height:"100%",position:"relative",background:"#000",overflow:"hidden"}} onClick={()=>{if(!hud)tapCheck();}}>
+      <video ref={videoRef} playsInline muted style={{display:"none"}}/>
+      <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
+
+      {/* верх: версия + статус */}
+      <div style={{position:"absolute",top:12,left:14,zIndex:5}}>
+        <div className="mono" style={{fontSize:"15px",fontWeight:800,color:"#fff"}}>АНТИСОН {VER}</div>
+        <div style={{fontSize:"12px",color:seeMark?"#00e87a":"#ffb84a",marginTop:"2px"}}>{seeMark?"✓ метку вижу":"⋯ ищу метку"}</div>
+      </div>
+      <div style={{position:"absolute",top:12,right:14,zIndex:5,textAlign:"right"}}>
+        <div className="mono" style={{fontSize:"22px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"}<span style={{fontSize:"11px",color:"#8a9bb0"}}> mph</span></div>
+        <div className="mono" style={{fontSize:"13px",color:"#8a9bb0"}}>{clock}</div>
+      </div>
+
+      {/* центр: видео (тест) или большой статус */}
+      {hud?(
+        <div style={{position:"absolute",top:"60px",left:"12px",right:"12px",zIndex:4}}>
+          <canvas ref={viewRef} width={320} height={240} style={{width:"100%",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
+          <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginTop:"6px",textAlign:"center"}}>порог:{autoThr} · подсветка:{Math.round(glowNow*100)}% · точек лога:{recN}</div>
+        </div>
+      ):(
+        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:2}}>
+          <div style={{fontSize:"15px",color:seeMark?"#00e87a":"#ffb84a"}}>{seeMark?"под контролем":"ищу метку на руле"}</div>
+          <div style={{fontSize:"12px",color:"#445",marginTop:"8px"}}>тапни экран, если попросит</div>
+        </div>
+      )}
+
+      {/* чек бдительности */}
+      {checkNow&&!alarm&&(
+        <div onClick={(e)=>{e.stopPropagation();tapCheck();}} style={{position:"absolute",inset:0,zIndex:20,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,0.4)"}}>
+          <div style={{width:"200px",height:"200px",borderRadius:"50%",background:"rgba(74,158,255,0.2)",border:"3px solid #4a9eff",display:"flex",alignItems:"center",justifyContent:"center",color:"#9fcfff",fontSize:"20px",fontWeight:800,textAlign:"center"}}>ТАПНИ<br/>живой?</div>
+        </div>
+      )}
+
+      {/* ТРЕВОГА */}
+      {alarm&&(
+        <div onClick={(e)=>{e.stopPropagation();tapCheck();}} style={{position:"absolute",inset:0,zIndex:30,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"rgba(120,0,0,0.85)",animation:"none"}}>
+          <div style={{fontSize:"40px",fontWeight:900,color:"#fff",marginBottom:"10px"}}>⚠ ПРОСНИСЬ</div>
+          <div style={{fontSize:"18px",color:"#ffd0d0",marginBottom:"30px"}}>тапни, чтобы отключить</div>
+          <div style={{width:"220px",height:"220px",borderRadius:"50%",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#a00",fontSize:"26px",fontWeight:900}}>СТОП</div>
+        </div>
+      )}
+
+      {/* нижняя подсветка: ярче внизу, гаснет к нижней четверти */}
+      <div style={{position:"absolute",left:0,right:0,bottom:0,height:"25%",pointerEvents:"none",zIndex:1,
+        background:`linear-gradient(0deg, rgba(${rgb},${glowNow}) 0%, rgba(${rgb},${glowNow*0.55}) 45%, rgba(${rgb},0) 100%)`}}/>
+
+      {/* низ: кнопки управления (в тесте) */}
+      <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"10px 12px 16px",display:"flex",gap:"8px",alignItems:"flex-end"}}>
+        <button onClick={(e)=>{e.stopPropagation();setHud(!hud);}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4"}}>{hud?"🌙 Спрятать":"👁 Показать"}</button>
+        <button onClick={(e)=>{e.stopPropagation();toggleRec();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:recRef.current?"1px solid #00e87a":"1px solid rgba(255,255,255,0.2)",background:recRef.current?"rgba(0,232,122,0.15)":"rgba(20,24,34,0.85)",color:recRef.current?"#8cffbe":"#c0c8d4"}}>{recRef.current?"● Пишу "+recN:"◉ Запись"}</button>
+        <button onClick={(e)=>{e.stopPropagation();download();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4"}}>⬇ Лог</button>
+        <button onClick={(e)=>{e.stopPropagation();stopAll();p.setScreen("home");}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("app")).render(<App/>);
+</script>
+</body>
+</html>
