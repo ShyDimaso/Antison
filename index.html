@@ -22,7 +22,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v1";
+const VER="v2";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -156,13 +156,12 @@ function Settings(p){
   );
 }
 
-function glowRGB(c){ return c==="white"?"255,255,255":c==="green"?"160,255,120":"255,190,110"; } // amber default
+function glowRGB(c){ return c==="white"?"255,255,255":c==="green"?"160,255,120":"255,190,110"; }
 
 function Run(p){
-  const T=(x)=>x;
-  const [phase,setPhase]=useState("init"); // init|live|error
+  const [phase,setPhase]=useState("init"); // init|setzone|live|error
   const [err,setErr]=useState("");
-  const [hud,setHud]=useState(p.showCam);   // показывать HUD/видео
+  const [hud,setHud]=useState(p.showCam);
   const [seeMark,setSeeMark]=useState(false);
   const [alarm,setAlarm]=useState(false);
   const [checkNow,setCheckNow]=useState(false);
@@ -171,43 +170,30 @@ function Run(p){
   const [spd,setSpd]=useState(null);
   const [clock,setClock]=useState("");
   const [recN,setRecN]=useState(0);
+  const [zone,setZone]=useState(null); // {x0,y0,x1,y1} в долях 0..1
+  const [drawing,setDrawing]=useState(null);
 
-  const videoRef=useRef(null),rawRef=useRef(null),viewRef=useRef(null),streamRef=useRef(null),rafRef=useRef(0);
+  const videoRef=useRef(null),rawRef=useRef(null),viewRef=useRef(null),setupRef=useRef(null),streamRef=useRef(null),rafRef=useRef(0);
   const lastXRef=useRef(null),stillMsRef=useRef(0),lastTsRef=useRef(0);
-  const thrRef=useRef(150),glowRef=useRef(p.glowMax),autoGlowRef=useRef(p.autoGlow);
-  const stageRef=useRef(0); // 0 ок, 1 писк, 2 тук-тук, 3 тревога
+  const thrRef=useRef(150),glowRef=useRef(p.glowMax),autoGlowRef=useRef(p.autoGlow),zoneRef=useRef(null);
+  const stageRef=useRef(0);
   const logRef=useRef([]),recRef=useRef(false);
-  const gyroLastRef=useRef(null);
   const checkTimerRef=useRef(0),checkArmedRef=useRef(false),checkDeadlineRef=useRef(0);
-  const AW=64,AH=48,MAXBLOB=Math.round(AW*AH*0.30);
+  const AW=64,AH=48;
 
-  // часы
-  useEffect(()=>{const id=setInterval(()=>{const d=new Date();setClock(d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));},1000);return()=>clearInterval(id);},[]);
+  useEffect(()=>{const id=setInterval(()=>{setClock(new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));},1000);return()=>clearInterval(id);},[]);
 
-  // GPS скорость (для красоты, локально)
   useEffect(()=>{
     let wid=null;
     try{ if(navigator.geolocation){ wid=navigator.geolocation.watchPosition(pos=>{ if(pos.coords.speed!=null&&pos.coords.speed>=0) setSpd(Math.round(pos.coords.speed*2.23694)); },()=>{},{enableHighAccuracy:true,maximumAge:1000}); } }catch(e){}
     return()=>{try{if(wid!=null)navigator.geolocation.clearWatch(wid);}catch(e){}};
   },[]);
 
-  // гироскоп: резкий увод
   useEffect(()=>{
     if(!p.gyroOn)return;
-    const onMot=(e)=>{
-      const r=e.rotationRate||{}; const yaw=Math.abs(r.alpha||0);
-      // резкий манёвр = большой всплеск рыскания
-      if(yaw>90){ // порог "перестройка/увод" (подберём на тестах)
-        if(recRef.current)logRef.current.push({t:Date.now(),ev:"GYRO_SWERVE",yaw:+yaw.toFixed(0)});
-        beep(700,120,p.vol*0.5);
-      }
-    };
-    let need=false;
-    const arm=async()=>{
-      try{ if(typeof DeviceMotionEvent!=="undefined"&&typeof DeviceMotionEvent.requestPermission==="function"){ await DeviceMotionEvent.requestPermission(); } }catch(e){}
-      window.addEventListener("devicemotion",onMot);
-    };
-    arm();
+    const onMot=(e)=>{ const r=e.rotationRate||{}; const yaw=Math.abs(r.alpha||0);
+      if(yaw>90){ if(recRef.current)logRef.current.push({t:Date.now(),ev:"GYRO_SWERVE",yaw:+yaw.toFixed(0)}); beep(700,120,p.vol*0.5); } };
+    (async()=>{ try{ if(typeof DeviceMotionEvent!=="undefined"&&typeof DeviceMotionEvent.requestPermission==="function") await DeviceMotionEvent.requestPermission(); }catch(e){} window.addEventListener("devicemotion",onMot); })();
     return()=>window.removeEventListener("devicemotion",onMot);
   },[p.gyroOn,p.vol]);
 
@@ -217,7 +203,8 @@ function Run(p){
       const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:320},height:{ideal:240}},audio:false});
       streamRef.current=s;
       if(videoRef.current){videoRef.current.srcObject=s;await videoRef.current.play().catch(()=>{});}
-      setPhase("live"); lastTsRef.current=Date.now(); armCheck(); loop();
+      setPhase("setzone"); // сначала просим обвести зону руля
+      drawSetup();
     }catch(e){ setErr((e&&e.name?e.name+": ":"")+(e&&e.message||String(e))); setPhase("error"); }
   };
   const stopAll=()=>{cancelAnimationFrame(rafRef.current);clearTimeout(checkTimerRef.current);if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}};
@@ -225,14 +212,47 @@ function Run(p){
   useEffect(()=>{glowRef.current=p.glowMax;setGlowNow(p.glowMax);},[p.glowMax]);
   useEffect(()=>{autoGlowRef.current=p.autoGlow;},[p.autoGlow]);
 
-  // кнопка бдительности
+  // ---- экран настройки зоны: показываем видео, рисуем прямоугольник пальцем ----
+  const setupDraw=useRef(0);
+  const drawSetup=()=>{
+    const v=videoRef.current,c=setupRef.current;
+    if(v&&c&&v.readyState>=2){
+      const ctx=c.getContext("2d"),W=c.width,H=c.height;
+      ctx.drawImage(v,0,0,W,H);
+      const z=drawing||zone;
+      // затемнить всё вне зоны
+      ctx.fillStyle="rgba(0,0,0,0.55)";
+      if(z){
+        const x0=z.x0*W,y0=z.y0*H,x1=z.x1*W,y1=z.y1*H;
+        const rx=Math.min(x0,x1),ry=Math.min(y0,y1),rw=Math.abs(x1-x0),rh=Math.abs(y1-y0);
+        ctx.fillRect(0,0,W,ry); ctx.fillRect(0,ry+rh,W,H-(ry+rh));
+        ctx.fillRect(0,ry,rx,rh); ctx.fillRect(rx+rw,ry,W-(rx+rw),rh);
+        ctx.strokeStyle="#00e87a";ctx.lineWidth=3;ctx.strokeRect(rx,ry,rw,rh);
+        ctx.fillStyle="rgba(0,232,122,0.9)";ctx.font="bold 13px sans-serif";
+        ctx.fillText("зона руля",rx+6,ry+18);
+      }else{
+        ctx.fillRect(0,0,W,H);
+        ctx.fillStyle="#fff";ctx.font="bold 16px sans-serif";ctx.textAlign="center";
+        ctx.fillText("Обведи пальцем зону руля",W/2,H/2);ctx.textAlign="left";
+      }
+    }
+    setupDraw.current=requestAnimationFrame(drawSetup);
+  };
+  const evtToNorm=(e,el)=>{const r=el.getBoundingClientRect();const t=e.touches?e.touches[0]:e;return{x:(t.clientX-r.left)/r.width,y:(t.clientY-r.top)/r.height};};
+  const onDown=(e)=>{const pt=evtToNorm(e,setupRef.current);setDrawing({x0:pt.x,y0:pt.y,x1:pt.x,y1:pt.y});};
+  const onMove=(e)=>{if(!drawing)return;const pt=evtToNorm(e,setupRef.current);setDrawing(d=>({...d,x1:pt.x,y1:pt.y}));};
+  const onUp=()=>{ if(drawing){ const z={x0:Math.min(drawing.x0,drawing.x1),y0:Math.min(drawing.y0,drawing.y1),x1:Math.max(drawing.x0,drawing.x1),y1:Math.max(drawing.y0,drawing.y1)}; if((z.x1-z.x0)>0.05&&(z.y1-z.y0)>0.05){setZone(z);zoneRef.current=z;} setDrawing(null); } };
+
+  const confirmZone=()=>{
+    cancelAnimationFrame(setupDraw.current);
+    setPhase("live"); lastTsRef.current=Date.now(); armCheck(); loop();
+  };
+  const resetZone=()=>{setZone(null);zoneRef.current=null;};
+
   const armCheck=()=>{
     if(!p.checkOn)return;
     clearTimeout(checkTimerRef.current);
-    checkTimerRef.current=setTimeout(()=>{
-      checkArmedRef.current=true; checkDeadlineRef.current=Date.now()+6000; setCheckNow(true);
-      beep(1000,200,p.vol*0.5);
-    },p.checkSec*1000);
+    checkTimerRef.current=setTimeout(()=>{ checkArmedRef.current=true; checkDeadlineRef.current=Date.now()+6000; setCheckNow(true); beep(1000,200,p.vol*0.5); },p.checkSec*1000);
   };
   const tapCheck=()=>{
     if(checkArmedRef.current){ checkArmedRef.current=false; setCheckNow(false); armCheck(); if(recRef.current)logRef.current.push({t:Date.now(),ev:"CHECK_OK"}); }
@@ -247,68 +267,80 @@ function Run(p){
       const rc=raw.getContext("2d",{willReadFrequently:true});
       rc.drawImage(v,0,0,AW,AH);
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
-      let n=0,sumX=0,mx=0; const lums=[];
+      // границы зоны (в пикселях анализа)
+      const z=zoneRef.current;
+      const zx0=z?Math.floor(z.x0*AW):0, zy0=z?Math.floor(z.y0*AH):0, zx1=z?Math.ceil(z.x1*AW):AW, zy1=z?Math.ceil(z.y1*AH):AH;
+      const zoneArea=Math.max(1,(zx1-zx0)*(zy1-zy0));
+      let n=0,sumX=0; const lums=[];
       if(img){
         const d=img.data;
-        for(let idx=0;idx<AW*AH;idx++){
-          const i=idx*4; const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+        for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){
+          const i=(y*AW+x)*4; const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
           lums.push(lum);
-          if(lum>=thrRef.current*p.sens){n++;sumX+=(idx%AW);}
-          if(lum>mx)mx=lum;
+          if(lum>=thrRef.current*p.sens){n++;sumX+=x;}
         }
       }
-      // адаптивный порог: 88-й процентиль яркости (против засветки фарами)
-      if(lums.length){ const s=lums.slice().sort((a,b)=>a-b); let th=s[Math.floor(s.length*0.88)]; th=Math.max(60,Math.min(245,th)); thrRef.current=thrRef.current*0.9+th*0.1; setAutoThr(Math.round(thrRef.current)); }
-      const tooBig=n>MAXBLOB; const good=(n>=3&&!tooBig);
+      // адаптивный порог: держим так, чтобы метка была ~3-12% зоны (не пол-кадра)
+      if(lums.length){
+        const s=lums.slice().sort((a,b)=>a-b);
+        let th=s[Math.floor(s.length*0.94)]; // берём только самые яркие ~6%
+        th=Math.max(90,Math.min(250,th));
+        thrRef.current=thrRef.current*0.85+th*0.15;
+        setAutoThr(Math.round(thrRef.current));
+      }
+      const frac=n/zoneArea;
+      // метка "хорошая" = видна, но не пол-зоны (иначе засветка/лицо в зоне)
+      const good=(n>=2 && frac<0.35);
       setSeeMark(good);
-      // авто-подсветка: не видим метку -> поднимаем свечение к максимуму; видим -> держим минимально нужное
+
       if(autoGlowRef.current){
         let g=glowRef.current;
-        if(!good) g=Math.min(p.glowMax, g+0.03); else g=Math.max(p.glowMax*0.4, g-0.02);
+        if(!good) g=Math.min(p.glowMax, g+0.03); else g=Math.max(p.glowMax*0.5, g-0.02);
         glowRef.current=g; setGlowNow(g);
       }
       let normX=lastXRef.current==null?0.5:lastXRef.current;
-      if(good)normX=(sumX/n)/AW;
+      if(good)normX=(sumX/n - zx0)/Math.max(1,(zx1-zx0));
       const mv=(lastXRef.current==null)?0:Math.abs(normX-lastXRef.current);
       lastXRef.current=normX;
 
-      // эскалация по неподвижности
-      const moving=mv>0.012; // порог "шевельнулась метка"
+      const moving=mv>0.012;
+      // ВАЖНО: тревожим ТОЛЬКО когда метка реально видна. Нет метки -> молчим, копим не наказываем.
       if(good){
         if(moving){ stillMsRef.current=0; if(stageRef.current>0){stageRef.current=0;setAlarm(false);} }
         else{ stillMsRef.current+=dt; }
-        const s=stillMsRef.current/1000;
-        if(s>=p.holdSec && stageRef.current<1){ stageRef.current=1; beep(900,160,p.vol*0.5); if(recRef.current)logRef.current.push({t:now,ev:"BEEP1"}); }
-        if(s>=p.holdSec+2 && stageRef.current<2){ stageRef.current=2; beep(1100,150,p.vol*0.6); setTimeout(()=>beep(1100,150,p.vol*0.6),200); if(recRef.current)logRef.current.push({t:now,ev:"TUKTUK"}); }
-        if(s>=p.holdSec+4 && stageRef.current<3){ stageRef.current=3; setAlarm(true); siren(6,p.vol); if(recRef.current)logRef.current.push({t:now,ev:"ALARM"}); }
+        const ss=stillMsRef.current/1000;
+        if(ss>=p.holdSec && stageRef.current<1){ stageRef.current=1; beep(900,160,p.vol*0.5); if(recRef.current)logRef.current.push({t:now,ev:"BEEP1"}); }
+        if(ss>=p.holdSec+2 && stageRef.current<2){ stageRef.current=2; beep(1100,150,p.vol*0.6); setTimeout(()=>beep(1100,150,p.vol*0.6),200); if(recRef.current)logRef.current.push({t:now,ev:"TUKTUK"}); }
+        if(ss>=p.holdSec+4 && stageRef.current<3){ stageRef.current=3; setAlarm(true); siren(6,p.vol); if(recRef.current)logRef.current.push({t:now,ev:"ALARM"}); }
       }else{
-        // метку не видим — не наказываем (может свет плохой), сбрасываем таймер медленнее
-        stillMsRef.current=Math.max(0,stillMsRef.current-dt*0.5);
+        // метки нет — сбрасываем накопление, НЕ пищим
+        stillMsRef.current=0; if(stageRef.current>0){stageRef.current=0;setAlarm(false);}
       }
 
-      // просрочен чек бдительности -> тревога
       if(checkArmedRef.current && Date.now()>checkDeadlineRef.current && !alarm){ setAlarm(true); siren(6,p.vol); if(recRef.current)logRef.current.push({t:now,ev:"CHECK_MISS"}); }
 
-      // рисуем HUD (если показываем)
       const view=viewRef.current;
       if(hud && view){
         const vc=view.getContext("2d"),VW=view.width,VH=view.height;
         vc.drawImage(v,0,0,VW,VH);
-        if(img && !tooBig){
+        // рамка зоны
+        if(z){ vc.strokeStyle="rgba(0,232,122,0.7)";vc.lineWidth=2;vc.strokeRect(z.x0*VW,z.y0*VH,(z.x1-z.x0)*VW,(z.y1-z.y0)*VH); }
+        if(img && good){
           vc.fillStyle="rgba(0,232,255,0.5)";const sx=VW/AW,sy=VH/AH,d=img.data;
-          for(let idx=0;idx<AW*AH;idx++){const i=idx*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;if(lum>=thrRef.current*p.sens){vc.fillRect((idx%AW)*sx,Math.floor(idx/AW)*sy,sx,sy);}}
+          for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){const i=(y*AW+x)*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;if(lum>=thrRef.current*p.sens){vc.fillRect(x*sx,y*sy,sx,sy);}}
+          const gx=(zx0+(sumX/n-zx0));
+          vc.strokeStyle="#ff6b35";vc.lineWidth=3;vc.beginPath();vc.moveTo((sumX/n/AW)*VW,z.y0*VH);vc.lineTo((sumX/n/AW)*VW,z.y1*VH);vc.stroke();
         }
-        if(good){vc.strokeStyle="#ff6b35";vc.lineWidth=3;vc.beginPath();vc.moveTo(normX*VW,0);vc.lineTo(normX*VW,VH);vc.stroke();}
       }
 
-      if(recRef.current){ logRef.current.push({t:now,x:+normX.toFixed(4),mv:+mv.toFixed(4),n:tooBig?-1:n,thr:Math.round(thrRef.current),stage:stageRef.current}); setRecN(logRef.current.length); }
+      if(recRef.current){ logRef.current.push({t:now,x:+normX.toFixed(4),mv:+mv.toFixed(4),n,frac:+frac.toFixed(3),thr:Math.round(thrRef.current),stage:stageRef.current,good:good?1:0}); setRecN(logRef.current.length); }
     }
     rafRef.current=requestAnimationFrame(()=>setTimeout(loop,110));
   };
 
   const toggleRec=()=>{ recRef.current=!recRef.current; if(recRef.current){logRef.current=[];setRecN(0);} };
   const download=()=>{
-    const out={meta:{app:"Antison",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,holdSec:p.holdSec,sens:p.sens,glowColor:p.glowColor,samples:logRef.current.length},rows:logRef.current};
+    const out={meta:{app:"Antison",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,holdSec:p.holdSec,sens:p.sens,glowColor:p.glowColor,zone:zoneRef.current,samples:logRef.current.length},rows:logRef.current};
     const blob=new Blob([JSON.stringify(out,null,1)],{type:"application/json"});
     const url=URL.createObjectURL(blob),a=document.createElement("a");
     a.href=url;a.download="antison_"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
@@ -321,8 +353,25 @@ function Run(p){
     <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
       <div style={{color:"#ff6666",fontSize:"15px",marginBottom:"10px"}}>Камера не открылась</div>
       <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"16px"}}>{err}</div>
-      <div style={{fontSize:"13px",color:"#8a9bb0",marginBottom:"20px",maxWidth:"320px",lineHeight:1.5}}>Нужен HTTPS и разрешение на камеру. Открывай через github.io или https.</div>
       <button onClick={()=>p.setScreen("home")} style={{padding:"12px 20px",borderRadius:"12px",border:"1px solid #4a9eff",background:"rgba(74,158,255,0.12)",color:"#9fcfff"}}>Назад</button>
+    </div>
+  );
+
+  // ---- экран обводки зоны ----
+  if(phase==="setzone") return (
+    <div style={{height:"100%",background:"#000",display:"flex",flexDirection:"column",padding:"12px"}}>
+      <div style={{fontSize:"15px",color:"#fff",fontWeight:700,marginBottom:"8px",textAlign:"center"}}>Обведи пальцем зону руля</div>
+      <div style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"10px",textAlign:"center"}}>Проведи пальцем прямоугольник вокруг руля / метки. Камера будет смотреть только туда.</div>
+      <video ref={videoRef} playsInline muted style={{display:"none"}}/>
+      <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
+      <canvas ref={setupRef} width={320} height={240}
+        onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
+        onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp}
+        style={{width:"100%",flex:1,borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",background:"#000",touchAction:"none"}}/>
+      <div style={{display:"flex",gap:"8px",marginTop:"12px"}}>
+        <button onClick={resetZone} style={{flex:1,padding:"14px",borderRadius:"12px",border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4",fontSize:"15px",fontWeight:700}}>↺ Заново</button>
+        <button onClick={confirmZone} disabled={!zone} style={{flex:2,padding:"14px",borderRadius:"12px",border:"1px solid #00e87a",background:zone?"linear-gradient(135deg,#0f401b,#1c6e32)":"rgba(20,24,34,0.5)",color:zone?"#8cffbe":"#556",fontSize:"16px",fontWeight:800}}>✓ Готово, начать</button>
+      </div>
     </div>
   );
 
@@ -331,7 +380,6 @@ function Run(p){
       <video ref={videoRef} playsInline muted style={{display:"none"}}/>
       <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
 
-      {/* верх: версия + статус */}
       <div style={{position:"absolute",top:12,left:14,zIndex:5}}>
         <div className="mono" style={{fontSize:"15px",fontWeight:800,color:"#fff"}}>АНТИСОН {VER}</div>
         <div style={{fontSize:"12px",color:seeMark?"#00e87a":"#ffb84a",marginTop:"2px"}}>{seeMark?"✓ метку вижу":"⋯ ищу метку"}</div>
@@ -341,44 +389,40 @@ function Run(p){
         <div className="mono" style={{fontSize:"13px",color:"#8a9bb0"}}>{clock}</div>
       </div>
 
-      {/* центр: видео (тест) или большой статус */}
       {hud?(
         <div style={{position:"absolute",top:"60px",left:"12px",right:"12px",zIndex:4}}>
           <canvas ref={viewRef} width={320} height={240} style={{width:"100%",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
-          <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginTop:"6px",textAlign:"center"}}>порог:{autoThr} · подсветка:{Math.round(glowNow*100)}% · точек лога:{recN}</div>
+          <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginTop:"6px",textAlign:"center"}}>порог:{autoThr} · свет:{Math.round(glowNow*100)}% · лог:{recN}</div>
         </div>
       ):(
-        <div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:2}}>
-          <div style={{fontSize:"15px",color:seeMark?"#00e87a":"#ffb84a"}}>{seeMark?"под контролем":"ищу метку на руле"}</div>
+        <div style={{position:"absolute",top:0,left:0,right:0,bottom:"33%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:2}}>
+          <div style={{fontSize:"16px",color:seeMark?"#00e87a":"#ffb84a",fontWeight:700}}>{seeMark?"✓ под контролем":"⋯ ищу метку на руле"}</div>
           <div style={{fontSize:"12px",color:"#445",marginTop:"8px"}}>тапни экран, если попросит</div>
         </div>
       )}
 
-      {/* чек бдительности */}
       {checkNow&&!alarm&&(
         <div onClick={(e)=>{e.stopPropagation();tapCheck();}} style={{position:"absolute",inset:0,zIndex:20,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,0.4)"}}>
-          <div style={{width:"200px",height:"200px",borderRadius:"50%",background:"rgba(74,158,255,0.2)",border:"3px solid #4a9eff",display:"flex",alignItems:"center",justifyContent:"center",color:"#9fcfff",fontSize:"20px",fontWeight:800,textAlign:"center"}}>ТАПНИ<br/>живой?</div>
+          <div style={{width:"210px",height:"210px",borderRadius:"50%",background:"rgba(74,158,255,0.25)",border:"3px solid #4a9eff",display:"flex",alignItems:"center",justifyContent:"center",color:"#9fcfff",fontSize:"22px",fontWeight:800,textAlign:"center"}}>ТАПНИ<br/>живой?</div>
         </div>
       )}
 
-      {/* ТРЕВОГА */}
       {alarm&&(
-        <div onClick={(e)=>{e.stopPropagation();tapCheck();}} style={{position:"absolute",inset:0,zIndex:30,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"rgba(120,0,0,0.85)",animation:"none"}}>
-          <div style={{fontSize:"40px",fontWeight:900,color:"#fff",marginBottom:"10px"}}>⚠ ПРОСНИСЬ</div>
-          <div style={{fontSize:"18px",color:"#ffd0d0",marginBottom:"30px"}}>тапни, чтобы отключить</div>
-          <div style={{width:"220px",height:"220px",borderRadius:"50%",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#a00",fontSize:"26px",fontWeight:900}}>СТОП</div>
+        <div onClick={(e)=>{e.stopPropagation();tapCheck();}} style={{position:"absolute",inset:0,zIndex:30,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"rgba(150,0,0,0.9)"}}>
+          <div style={{fontSize:"44px",fontWeight:900,color:"#fff",marginBottom:"10px"}}>⚠ ПРОСНИСЬ</div>
+          <div style={{fontSize:"18px",color:"#ffd0d0",marginBottom:"26px"}}>тапни, чтобы отключить</div>
+          <div style={{width:"230px",height:"230px",borderRadius:"50%",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",color:"#a00",fontSize:"30px",fontWeight:900}}>СТОП</div>
         </div>
       )}
 
-      {/* нижняя подсветка: ярче внизу, гаснет к нижней четверти */}
-      <div style={{position:"absolute",left:0,right:0,bottom:0,height:"25%",pointerEvents:"none",zIndex:1,
-        background:`linear-gradient(0deg, rgba(${rgb},${glowNow}) 0%, rgba(${rgb},${glowNow*0.55}) 45%, rgba(${rgb},0) 100%)`}}/>
+      {/* КРУПНАЯ подсветка снизу: до 33% высоты, ярко у низа, плавно гаснет */}
+      <div style={{position:"absolute",left:0,right:0,bottom:0,height:"33%",pointerEvents:"none",zIndex:1,
+        background:`linear-gradient(0deg, rgba(${rgb},${Math.min(1,glowNow*1.3)}) 0%, rgba(${rgb},${glowNow*0.8}) 40%, rgba(${rgb},${glowNow*0.3}) 75%, rgba(${rgb},0) 100%)`}}/>
 
-      {/* низ: кнопки управления (в тесте) */}
-      <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"10px 12px 16px",display:"flex",gap:"8px",alignItems:"flex-end"}}>
-        <button onClick={(e)=>{e.stopPropagation();setHud(!hud);}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4"}}>{hud?"🌙 Спрятать":"👁 Показать"}</button>
-        <button onClick={(e)=>{e.stopPropagation();toggleRec();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:recRef.current?"1px solid #00e87a":"1px solid rgba(255,255,255,0.2)",background:recRef.current?"rgba(0,232,122,0.15)":"rgba(20,24,34,0.85)",color:recRef.current?"#8cffbe":"#c0c8d4"}}>{recRef.current?"● Пишу "+recN:"◉ Запись"}</button>
-        <button onClick={(e)=>{e.stopPropagation();download();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4"}}>⬇ Лог</button>
+      <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"10px 12px 16px",display:"flex",gap:"8px"}}>
+        <button onClick={(e)=>{e.stopPropagation();setHud(!hud);}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>{hud?"🌙 Спрятать":"👁 Показать"}</button>
+        <button onClick={(e)=>{e.stopPropagation();toggleRec();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:recRef.current?"1px solid #00e87a":"1px solid rgba(255,255,255,0.2)",background:recRef.current?"rgba(0,232,122,0.15)":"rgba(20,24,34,0.9)",color:recRef.current?"#8cffbe":"#c0c8d4"}}>{recRef.current?"● "+recN:"◉ Запись"}</button>
+        <button onClick={(e)=>{e.stopPropagation();download();}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог</button>
         <button onClick={(e)=>{e.stopPropagation();stopAll();p.setScreen("home");}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
       </div>
     </div>
