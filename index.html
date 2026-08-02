@@ -22,7 +22,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v7";
+const VER="v8";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -65,8 +65,19 @@ function siren(times,vol){
    приложение запоминает, где для тебя граница полосы.
    Микрофон слушает поворотник. Лог сам. Без интернета.
    ============================================================ */
+/* ============================================================
+   ANTISON — ТЕСТ ПОЛОСЫ v8
+   Детектор по КРАЯМ (принцип Canny), а не по яркости.
+   Разметка = перепад яркости: асфальт→светлое (левый край линии)
+   и светлое→асфальт (правый край) на ширине ~линии. Ловит даже
+   тусклую разметку, т.к. важен ПЕРЕПАД, не абсолютная яркость.
+   Кадр сглаживаем (меньше шума). Оставляем только то, что
+   вертикально выстраивается в прямую = линия, а не блик.
+   Авто-зона: нижняя треть. Меню сверху (телефон стоит низко).
+   Калибровка кнопками "на линии". Микрофон = поворотник. Лог сам.
+   ============================================================ */
 function LaneTest({vol,setScreen}){
-  const [phase,setPhase]=React.useState("init"); // init|live|error
+  const [phase,setPhase]=React.useState("init");
   const [err,setErr]=React.useState("");
   const [leftX,setLeftX]=React.useState(null);
   const [rightX,setRightX]=React.useState(null);
@@ -75,7 +86,7 @@ function LaneTest({vol,setScreen}){
   const [recN,setRecN]=React.useState(0);
   const [spd,setSpd]=React.useState(null);
   const [clock,setClock]=React.useState("");
-  const [calL,setCalL]=React.useState(null); // калибр. позиция левой границы
+  const [calL,setCalL]=React.useState(null);
   const [calR,setCalR]=React.useState(null);
   const [holdL,setHoldL]=React.useState(false);
   const [holdR,setHoldR]=React.useState(false);
@@ -89,7 +100,7 @@ function LaneTest({vol,setScreen}){
   const calLRef=React.useRef(null),calRRef=React.useRef(null);
   const holdLRef=React.useRef(false),holdRRef=React.useRef(false);
   const AW=96,AH=72;
-  const Z0=Math.floor(AH*0.66); // авто-зона: нижняя треть
+  const Z0=Math.floor(AH*0.60); // нижняя ~40%
 
   React.useEffect(()=>{const id=setInterval(()=>setClock(new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})),1000);return()=>clearInterval(id);},[]);
   React.useEffect(()=>{
@@ -98,7 +109,7 @@ function LaneTest({vol,setScreen}){
     return()=>{try{if(wid!=null)navigator.geolocation.clearWatch(wid);}catch(e){}};
   },[]);
 
-  // микрофон: поворотник (чувствительнее)
+  // микрофон -> поворотник
   React.useEffect(()=>{
     let ac,an,src,raf2,stream2;
     (async()=>{
@@ -113,14 +124,10 @@ function LaneTest({vol,setScreen}){
           an.getByteFrequencyData(buf);
           let s=0;for(let i=0;i<buf.length;i++)s+=buf[i];
           const level=s/buf.length;
-          if(level-lastLevel>10 && level>18){ // чувствительнее порог
-            const now=Date.now();
-            clickTimes.push(now);clickTimes=clickTimes.filter(t=>now-t<3500);
-            if(clickTimes.length>=2){
-              const gaps=[];for(let i=1;i<clickTimes.length;i++)gaps.push(clickTimes[i]-clickTimes[i-1]);
-              const rhythmic=gaps.some(g=>g>300&&g<1300);
-              if(rhythmic){blinkerRef.current=true;blinkerUntilRef.current=now+2500;setBlinker(true);}
-            }
+          if(level-lastLevel>10 && level>18){
+            const now=Date.now();clickTimes.push(now);clickTimes=clickTimes.filter(t=>now-t<3500);
+            if(clickTimes.length>=2){const gaps=[];for(let i=1;i<clickTimes.length;i++)gaps.push(clickTimes[i]-clickTimes[i-1]);
+              if(gaps.some(g=>g>300&&g<1300)){blinkerRef.current=true;blinkerUntilRef.current=now+2500;setBlinker(true);}}
           }
           lastLevel=level*0.5+lastLevel*0.5;
           if(blinkerRef.current&&Date.now()>blinkerUntilRef.current){blinkerRef.current=false;setBlinker(false);}
@@ -144,46 +151,47 @@ function LaneTest({vol,setScreen}){
   const stopAll=()=>{cancelAnimationFrame(rafRef.current);if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}};
   React.useEffect(()=>{startCam();return()=>stopAll();},[]);
 
-  // ---- ДЕТЕКТОР ЛИНИЙ ПО ФОРМЕ ----
-  // для каждого столбца x в нижней трети считаем "оценку линии":
-  // сколько строк в этом столбце заметно СВЕТЛЕЕ, чем пиксели слева и справа
-  // от него (узкая светлая вертикальная черта = разметка, а не общий блик).
-  const detectLines=(img)=>{
+  // ---- ДЕТЕКТОР ЛИНИЙ ПО КРАЯМ ----
+  const detect=(img)=>{
     const d=img.data;
-    // средняя яркость зоны
-    let sum=0,cnt=0;
-    for(let y=Z0;y<AH;y++)for(let x=0;x<AW;x++){const i=(y*AW+x)*4;sum+=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;cnt++;}
-    const mean=cnt?sum/cnt:0;
-    const GAP=4; // на сколько пикселей смотрим влево/вправо для контраста
-    const colScore=new Float32Array(AW);
-    for(let x=GAP;x<AW-GAP;x++){
-      let score=0;
-      for(let y=Z0;y<AH;y++){
-        const i=(y*AW+x)*4; const c=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
-        const il=(y*AW+(x-GAP))*4, ir=(y*AW+(x+GAP))*4;
-        const cl=d[il]*0.299+d[il+1]*0.587+d[il+2]*0.114;
-        const cr=d[ir]*0.299+d[ir+1]*0.587+d[ir+2]*0.114;
-        // пиксель ярче окружения слева И справа (узкая светлая черта) и вообще светлый
-        if(c>cl+16 && c>cr+16 && c>mean+14) score++;
+    // 1) яркость в grayscale + лёгкое горизонтальное сглаживание (шумоподавление)
+    const W=AW,H=AH;
+    const gray=new Float32Array(W*H);
+    for(let y=Z0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;gray[y*W+x]=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;}
+    // 2) горизонтальный градиент (перепад яркости слева-направо) = край
+    // положительный перепал (тёмное->светлое) = левый край линии
+    // отрицательный (светлое->тёмное) = правый край линии
+    // линия шириной ~2-6 пикселей: ищем пару "+край" затем "-край" рядом.
+    const zoneH=H-Z0;
+    const colVote=new Float32Array(W); // за какой столбец "голосуют" центры линий
+    const STEP=2; // на сколько пикселей считаем перепад
+    const EDGE=10; // минимальный перепад, чтобы считать краем (тусклая разметка тоже даёт ~10-20)
+    const MAXW=8; // макс ширина линии в пикселях
+    for(let y=Z0;y<H;y++){
+      // соберём знаковые края в этой строке
+      for(let x=STEP;x<W-STEP-MAXW;x++){
+        const g=gray[y*W+x+STEP]-gray[y*W+x-STEP]; // перепад
+        if(g>EDGE){
+          // нашли левый край (светлеет). ищем правый край (темнеет) в пределах MAXW
+          for(let w=2;w<=MAXW;w++){
+            const g2=gray[y*W+x+w+STEP]-gray[y*W+x+w-STEP];
+            if(g2<-EDGE){ const center=x+Math.floor(w/2); colVote[center]+=1; break; }
+          }
+        }
       }
-      colScore[x]=score;
     }
-    // порог: столбец считается "линией", если светлых-в-черте строк набралось достаточно
-    const zoneH=AH-Z0;
-    const need=Math.max(3,zoneH*0.35);
-    // ищем ЛЕВУЮ линию: сильнейший столбец в левой половине; ПРАВУЮ: в правой
-    let bestL=-1,bestLs=need, bestR=-1,bestRs=need;
-    const mid=AW/2;
-    for(let x=GAP;x<AW-GAP;x++){
-      if(colScore[x]<need) continue;
-      if(x<mid){ if(colScore[x]>bestLs){bestLs=colScore[x];bestL=x;} }
-      else { if(colScore[x]>bestRs){bestRs=colScore[x];bestR=x;} }
+    // 3) столбцы с большим числом голосов по вертикали = вертикально выстроенная линия
+    const need=Math.max(3,zoneH*0.30);
+    // сгладим голоса по соседям (реальная линия даёт кластер соседних столбцов)
+    const sm=new Float32Array(W);
+    for(let x=1;x<W-1;x++) sm[x]=colVote[x-1]*0.5+colVote[x]+colVote[x+1]*0.5;
+    let bestL=-1,bestLs=need,bestR=-1,bestRs=need; const mid=W/2;
+    for(let x=2;x<W-2;x++){
+      if(sm[x]<need)continue;
+      if(x<mid){if(sm[x]>bestLs){bestLs=sm[x];bestL=x;}}
+      else{if(sm[x]>bestRs){bestRs=sm[x];bestR=x;}}
     }
-    return {
-      lX: bestL>=0? bestL/AW : null,
-      rX: bestR>=0? bestR/AW : null,
-      colScore, need, mean
-    };
+    return {lX:bestL>=0?bestL/W:null, rX:bestR>=0?bestR/W:null, sm, need};
   };
 
   const loop=()=>{
@@ -193,51 +201,37 @@ function LaneTest({vol,setScreen}){
       const rc=raw.getContext("2d",{willReadFrequently:true});
       rc.drawImage(v,0,0,AW,AH);
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
-      let res={lX:null,rX:null,colScore:null,need:0,mean:0};
-      if(img) res=detectLines(img);
-      // сглаживание позиций
-      if(res.lX!=null) leftXRef.current = leftXRef.current==null?res.lX:leftXRef.current*0.6+res.lX*0.4;
-      else leftXRef.current=null;
-      if(res.rX!=null) rightXRef.current = rightXRef.current==null?res.rX:rightXRef.current*0.6+res.rX*0.4;
-      else rightXRef.current=null;
+      let res={lX:null,rX:null,sm:null,need:0};
+      if(img) res=detect(img);
+      if(res.lX!=null) leftXRef.current=leftXRef.current==null?res.lX:leftXRef.current*0.6+res.lX*0.4; else leftXRef.current=null;
+      if(res.rX!=null) rightXRef.current=rightXRef.current==null?res.rX:rightXRef.current*0.6+res.rX*0.4; else rightXRef.current=null;
       setLeftX(leftXRef.current);setRightX(rightXRef.current);
 
-      // калибровка: пока держишь кнопку — записываем текущую позицию линии как границу
-      if(holdLRef.current && leftXRef.current!=null){ calLRef.current=leftXRef.current; setCalL(leftXRef.current); }
-      if(holdRRef.current && rightXRef.current!=null){ calRRef.current=rightXRef.current; setCalR(rightXRef.current); }
+      if(holdLRef.current&&leftXRef.current!=null){calLRef.current=leftXRef.current;setCalL(leftXRef.current);}
+      if(holdRRef.current&&rightXRef.current!=null){calRRef.current=rightXRef.current;setCalR(rightXRef.current);}
 
-      // ТРЕВОГА: линия подошла к калиброванной границе "я на линии" и поворотник не включён
       const blink=blinkerRef.current;
-      let stage=0, side="";
+      let stage=0,side="";
       if(!blink){
-        // левая: если текущая левая линия сместилась ВПРАВО к калибровке (наезжаешь на неё)
-        if(calLRef.current!=null && leftXRef.current!=null && leftXRef.current>=calLRef.current-0.02){ stage=2; side="L"; }
-        else if(calLRef.current!=null && leftXRef.current!=null && leftXRef.current>=calLRef.current-0.06){ stage=1; side="L"; }
-        if(calRRef.current!=null && rightXRef.current!=null && rightXRef.current<=calRRef.current+0.02){ stage=2; side="R"; }
-        else if(calRRef.current!=null && rightXRef.current!=null && rightXRef.current<=calRRef.current+0.06){ if(stage<1){stage=1;side="R";} }
+        if(calLRef.current!=null&&leftXRef.current!=null){ if(leftXRef.current>=calLRef.current-0.02){stage=2;side="L";} else if(leftXRef.current>=calLRef.current-0.06){stage=1;side="L";} }
+        if(calRRef.current!=null&&rightXRef.current!=null){ if(rightXRef.current<=calRRef.current+0.02){stage=2;side="R";} else if(rightXRef.current<=calRRef.current+0.06&&stage<1){stage=1;side="R";} }
       }
-      if(stage>=2 && !alarmRef.current){ alarmRef.current=true; setAlarm(true); beep(950,180,vol*0.6); setTimeout(()=>beep(950,180,vol*0.6),220); }
-      else if(stage===1 && !alarmRef.current){ beep(800,110,vol*0.4); }
-      else if(stage===0 && alarmRef.current){ alarmRef.current=false; setAlarm(false); }
+      if(stage>=2&&!alarmRef.current){alarmRef.current=true;setAlarm(true);beep(950,180,vol*0.6);setTimeout(()=>beep(950,180,vol*0.6),220);}
+      else if(stage===1&&!alarmRef.current){beep(800,110,vol*0.4);}
+      else if(stage===0&&alarmRef.current){alarmRef.current=false;setAlarm(false);}
 
-      // HUD
       const view=viewRef.current;
       if(view){
         const vc=view.getContext("2d"),VW=view.width,VH=view.height;
         vc.drawImage(v,0,0,VW,VH);
-        // граница зоны (нижняя треть)
         const zy=Z0/AH*VH;
         vc.strokeStyle="rgba(74,158,255,0.4)";vc.lineWidth=1;vc.beginPath();vc.moveTo(0,zy);vc.lineTo(VW,zy);vc.stroke();
         vc.fillStyle="rgba(74,158,255,0.6)";vc.font="11px sans-serif";vc.fillText("зона дороги ↓",6,zy+13);
-        // подсветка колонок-линий
-        if(res.colScore){const sx=VW/AW;
-          for(let x=0;x<AW;x++){ if(res.colScore[x]>=res.need){ vc.fillStyle="rgba(0,232,255,0.35)"; vc.fillRect(x*sx,zy,sx,VH-zy);} }
-        }
+        if(res.sm){const sx=VW/AW;for(let x=0;x<AW;x++){if(res.sm[x]>=res.need){vc.fillStyle="rgba(0,232,255,0.4)";vc.fillRect(x*sx,zy,sx,VH-zy);}}}
         if(leftXRef.current!=null){const px=leftXRef.current*VW;vc.strokeStyle="#ffd23f";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
         if(rightXRef.current!=null){const px=rightXRef.current*VW;vc.strokeStyle="#fff";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
-        // калибр. границы (красные)
-        if(calLRef.current!=null){const px=calLRef.current*VW;vc.strokeStyle="rgba(255,80,80,0.8)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
-        if(calRRef.current!=null){const px=calRRef.current*VW;vc.strokeStyle="rgba(255,80,80,0.8)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
+        if(calLRef.current!=null){const px=calLRef.current*VW;vc.strokeStyle="rgba(255,80,80,0.85)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
+        if(calRRef.current!=null){const px=calRRef.current*VW;vc.strokeStyle="rgba(255,80,80,0.85)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
       }
 
       logRef.current.push({t:Date.now()-startTsRef.current,lX:leftXRef.current!=null?+leftXRef.current.toFixed(3):null,rX:rightXRef.current!=null?+rightXRef.current.toFixed(3):null,calL:calLRef.current,calR:calRRef.current,blink:blink?1:0,stage,side});
@@ -253,7 +247,6 @@ function LaneTest({vol,setScreen}){
     a.href=url;a.download="antison_lane_"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
     document.body.appendChild(a);a.click();setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},400);
   };
-
   const pressL=(v)=>{holdLRef.current=v;setHoldL(v);};
   const pressR=(v)=>{holdRRef.current=v;setHoldR(v);};
   const clearCal=()=>{calLRef.current=null;calRRef.current=null;setCalL(null);setCalR(null);};
@@ -272,45 +265,41 @@ function LaneTest({vol,setScreen}){
     <video ref={videoRef} playsInline muted autoPlay style={{display:"none"}}/>
     <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
 
-    <div style={{height:"100%",position:"relative",background:"#000",overflow:"hidden"}}>
-      <div style={{position:"absolute",top:10,left:14,zIndex:5}}>
-        <div className="mono" style={{fontSize:"20px",fontWeight:900,color:"#fff"}}>ПОЛОСА {VER}</div>
-        <div style={{fontSize:"15px",fontWeight:800,marginTop:"2px",color:(leftX!=null||rightX!=null)?"#00e87a":"#ffb84a"}}>{(leftX!=null||rightX!=null)?"✓ вижу линии":"⋯ ищу линии"}{blinker?" · 🔄 поворотник":""}</div>
-      </div>
-      <div style={{position:"absolute",top:10,right:14,zIndex:5,textAlign:"right"}}>
-        <div className="mono" style={{fontSize:"20px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"}<span style={{fontSize:"11px",color:"#8a9bb0"}}> mph</span></div>
-        <div className="mono" style={{fontSize:"13px",color:"#8a9bb0"}}>{clock}</div>
+    <div style={{height:"100%",position:"relative",background:"#000",overflow:"hidden",display:"flex",flexDirection:"column"}}>
+      {/* ВЕРХНЕЕ МЕНЮ (телефон стоит низко — управление сверху) */}
+      <div style={{padding:"8px 10px 6px",background:"rgba(10,13,20,0.95)",borderBottom:"1px solid rgba(74,158,255,0.2)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
+          <div>
+            <span className="mono" style={{fontSize:"19px",fontWeight:900,color:"#fff"}}>ПОЛОСА {VER}</span>
+            <span style={{fontSize:"14px",fontWeight:800,marginLeft:"8px",color:(leftX!=null||rightX!=null)?"#00e87a":"#ffb84a"}}>{(leftX!=null||rightX!=null)?"✓ линии":"⋯ ищу"}{blinker?" 🔄":""}</span>
+          </div>
+          <div className="mono" style={{fontSize:"16px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"}<span style={{fontSize:"10px",color:"#8a9bb0"}}> mph</span> · {clock}</div>
+        </div>
+        {/* калибровочные кнопки — сверху */}
+        <div style={{display:"flex",gap:"6px",marginBottom:"6px"}}>
+          <button
+            onTouchStart={(e)=>{e.preventDefault();pressL(true);}} onTouchEnd={()=>pressL(false)}
+            onMouseDown={()=>pressL(true)} onMouseUp={()=>pressL(false)} onMouseLeave={()=>pressL(false)}
+            style={{flex:1,padding:"13px 6px",borderRadius:"10px",fontSize:"13px",fontWeight:800,border:holdL?"2px solid #ffd23f":"1px solid rgba(255,210,63,0.5)",background:holdL?"rgba(255,210,63,0.25)":"rgba(20,24,34,0.9)",color:"#ffd23f"}}>◀ держи: НА ЛЕВОЙ</button>
+          <button
+            onTouchStart={(e)=>{e.preventDefault();pressR(true);}} onTouchEnd={()=>pressR(false)}
+            onMouseDown={()=>pressR(true)} onMouseUp={()=>pressR(false)} onMouseLeave={()=>pressR(false)}
+            style={{flex:1,padding:"13px 6px",borderRadius:"10px",fontSize:"13px",fontWeight:800,border:holdR?"2px solid #fff":"1px solid rgba(255,255,255,0.5)",background:holdR?"rgba(255,255,255,0.22)":"rgba(20,24,34,0.9)",color:"#fff"}}>НА ПРАВОЙ: держи ▶</button>
+        </div>
+        <div style={{display:"flex",gap:"6px"}}>
+          <button onClick={clearCal} style={{flex:1,padding:"9px",borderRadius:"9px",fontSize:"12px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>↺ Сброс</button>
+          <button onClick={download} style={{flex:1,padding:"9px",borderRadius:"9px",fontSize:"12px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог:{recN}</button>
+          <button onClick={()=>{stopAll();setScreen("home");}} style={{flex:1,padding:"9px",borderRadius:"9px",fontSize:"12px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
+        </div>
+        <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginTop:"5px",textAlign:"center"}}>{calL!=null||calR!=null?"калибровка задана ✓ (наедешь на линию — тревога)":"наедь на линию колесом и держи кнопку"}</div>
       </div>
 
-      <div style={{position:"absolute",top:"58px",left:"10px",right:"10px",zIndex:4}}>
+      {/* видео снизу */}
+      <div style={{flex:1,position:"relative",padding:"8px",display:"flex",alignItems:"center",justifyContent:"center"}}>
         <canvas ref={viewRef} width={320} height={240} style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
-        <div className="mono" style={{fontSize:"14px",color:"#a8b4c4",marginTop:"6px",textAlign:"center"}}>
-          {calL!=null||calR!=null?"калибровка задана ✓":"наезжай на линию и держи кнопку для калибровки"} · лог:{recN}
-        </div>
-      </div>
-
-      {alarm&&(
-        <div style={{position:"absolute",top:"58px",left:"10px",right:"10px",zIndex:8,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
-          <div style={{marginTop:"90px",background:"rgba(150,0,0,0.85)",color:"#fff",fontSize:"26px",fontWeight:900,padding:"14px 22px",borderRadius:"14px"}}>⚠ ПОКИНУЛ ПОЛОСУ</div>
-        </div>
-      )}
-
-      {/* калибровочные кнопки */}
-      <div style={{position:"absolute",bottom:"74px",left:0,right:0,zIndex:6,padding:"0 10px",display:"flex",gap:"8px"}}>
-        <button
-          onTouchStart={(e)=>{e.preventDefault();pressL(true);}} onTouchEnd={()=>pressL(false)}
-          onMouseDown={()=>pressL(true)} onMouseUp={()=>pressL(false)} onMouseLeave={()=>pressL(false)}
-          style={{flex:1,padding:"16px",borderRadius:"12px",fontSize:"14px",fontWeight:800,border:holdL?"2px solid #ffd23f":"1px solid rgba(255,210,63,0.5)",background:holdL?"rgba(255,210,63,0.25)":"rgba(20,24,34,0.9)",color:"#ffd23f"}}>◀ держи: НА ЛИНИИ СЛЕВА</button>
-        <button
-          onTouchStart={(e)=>{e.preventDefault();pressR(true);}} onTouchEnd={()=>pressR(false)}
-          onMouseDown={()=>pressR(true)} onMouseUp={()=>pressR(false)} onMouseLeave={()=>pressR(false)}
-          style={{flex:1,padding:"16px",borderRadius:"12px",fontSize:"14px",fontWeight:800,border:holdR?"2px solid #fff":"1px solid rgba(255,255,255,0.5)",background:holdR?"rgba(255,255,255,0.22)":"rgba(20,24,34,0.9)",color:"#fff"}}>НА ЛИНИИ СПРАВА: держи ▶</button>
-      </div>
-
-      <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"8px 10px 14px",display:"flex",gap:"8px"}}>
-        <button onClick={clearCal} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>↺ Сброс калибр.</button>
-        <button onClick={download} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог</button>
-        <button onClick={()=>{stopAll();setScreen("home");}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
+        {alarm&&(
+          <div style={{position:"absolute",background:"rgba(150,0,0,0.85)",color:"#fff",fontSize:"26px",fontWeight:900,padding:"14px 22px",borderRadius:"14px"}}>⚠ ПОКИНУЛ ПОЛОСУ</div>
+        )}
       </div>
     </div>
    </React.Fragment>
