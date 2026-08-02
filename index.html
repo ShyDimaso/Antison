@@ -22,7 +22,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v6";
+const VER="v7";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -56,29 +56,40 @@ function siren(times,vol){
    Ловим увод машины из полосы. Микрофон слушает щелчки поворотника.
    Лог пишется сам. Эфир/интернет не нужен.
    ============================================================ */
+/* ============================================================
+   ANTISON — ТЕСТ ПОЛОСЫ v7
+   Авто-зона: нижняя треть кадра (дорога перед капотом).
+   Детектор ЛИНИЙ (не пятен): ищем столбцы, где есть узкая
+   вертикальная светлая черта (разметка), а не просто светлое.
+   Калибровка: жмёшь "на линии слева/справа" когда наехал колесом —
+   приложение запоминает, где для тебя граница полосы.
+   Микрофон слушает поворотник. Лог сам. Без интернета.
+   ============================================================ */
 function LaneTest({vol,setScreen}){
-  const [phase,setPhase]=React.useState("init"); // init|setzone|live|error
+  const [phase,setPhase]=React.useState("init"); // init|live|error
   const [err,setErr]=React.useState("");
-  const [zone,setZone]=React.useState(null);
-  const [drawing,setDrawing]=React.useState(null);
-  const [leftX,setLeftX]=React.useState(null);   // положение левой линии 0..1
-  const [rightX,setRightX]=React.useState(null); // правой
-  const [center,setCenter]=React.useState(0.5);  // центр полосы
-  const [offset,setOffset]=React.useState(0);    // смещение от центра
-  const [blinker,setBlinker]=React.useState(false); // слышен поворотник
+  const [leftX,setLeftX]=React.useState(null);
+  const [rightX,setRightX]=React.useState(null);
+  const [blinker,setBlinker]=React.useState(false);
   const [alarm,setAlarm]=React.useState(false);
   const [recN,setRecN]=React.useState(0);
   const [spd,setSpd]=React.useState(null);
   const [clock,setClock]=React.useState("");
-  const [autoThr,setAutoThr]=React.useState(150);
+  const [calL,setCalL]=React.useState(null); // калибр. позиция левой границы
+  const [calR,setCalR]=React.useState(null);
+  const [holdL,setHoldL]=React.useState(false);
+  const [holdR,setHoldR]=React.useState(false);
 
-  const videoRef=React.useRef(null),rawRef=React.useRef(null),viewRef=React.useRef(null),setupRef=React.useRef(null);
+  const videoRef=React.useRef(null),rawRef=React.useRef(null),viewRef=React.useRef(null);
   const streamRef=React.useRef(null),rafRef=React.useRef(0);
-  const zoneRef=React.useRef(null),thrRef=React.useRef(150);
   const logRef=React.useRef([]),startTsRef=React.useRef(Date.now());
-  const offEmaRef=React.useRef(0),alarmRef=React.useRef(false);
+  const alarmRef=React.useRef(false);
   const blinkerRef=React.useRef(false),blinkerUntilRef=React.useRef(0);
-  const AW=96,AH=72; // чуть выше разрешение — дорога детальнее
+  const leftXRef=React.useRef(null),rightXRef=React.useRef(null);
+  const calLRef=React.useRef(null),calRRef=React.useRef(null);
+  const holdLRef=React.useRef(false),holdRRef=React.useRef(false);
+  const AW=96,AH=72;
+  const Z0=Math.floor(AH*0.66); // авто-зона: нижняя треть
 
   React.useEffect(()=>{const id=setInterval(()=>setClock(new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})),1000);return()=>clearInterval(id);},[]);
   React.useEffect(()=>{
@@ -87,34 +98,32 @@ function LaneTest({vol,setScreen}){
     return()=>{try{if(wid!=null)navigator.geolocation.clearWatch(wid);}catch(e){}};
   },[]);
 
-  // микрофон: слушаем щелчки поворотника (резкие короткие всплески ~1-2 Гц)
+  // микрофон: поворотник (чувствительнее)
   React.useEffect(()=>{
     let ac,an,src,raf2,stream2;
     (async()=>{
       try{
         stream2=await navigator.mediaDevices.getUserMedia({audio:true});
         ac=new (window.AudioContext||window.webkitAudioContext)();
-        an=ac.createAnalyser();an.fftSize=512;
+        an=ac.createAnalyser();an.fftSize=1024;
         src=ac.createMediaStreamSource(stream2);src.connect(an);
         const buf=new Uint8Array(an.frequencyBinCount);
-        let lastLevel=0, clickTimes=[];
+        let lastLevel=0,clickTimes=[];
         const tick=()=>{
           an.getByteFrequencyData(buf);
           let s=0;for(let i=0;i<buf.length;i++)s+=buf[i];
           const level=s/buf.length;
-          // резкий скачок громкости = потенциальный щелчок
-          if(level-lastLevel>18 && level>30){
+          if(level-lastLevel>10 && level>18){ // чувствительнее порог
             const now=Date.now();
-            clickTimes.push(now); clickTimes=clickTimes.filter(t=>now-t<3000);
-            // поворотник: 2+ щелчка с интервалом 0.4-1.0 сек
+            clickTimes.push(now);clickTimes=clickTimes.filter(t=>now-t<3500);
             if(clickTimes.length>=2){
               const gaps=[];for(let i=1;i<clickTimes.length;i++)gaps.push(clickTimes[i]-clickTimes[i-1]);
-              const rhythmic=gaps.some(g=>g>350&&g<1100);
-              if(rhythmic){ blinkerRef.current=true; blinkerUntilRef.current=now+2500; setBlinker(true); }
+              const rhythmic=gaps.some(g=>g>300&&g<1300);
+              if(rhythmic){blinkerRef.current=true;blinkerUntilRef.current=now+2500;setBlinker(true);}
             }
           }
-          lastLevel=level;
-          if(blinkerRef.current && Date.now()>blinkerUntilRef.current){ blinkerRef.current=false; setBlinker(false); }
+          lastLevel=level*0.5+lastLevel*0.5;
+          if(blinkerRef.current&&Date.now()>blinkerUntilRef.current){blinkerRef.current=false;setBlinker(false);}
           raf2=requestAnimationFrame(tick);
         };
         raf2=requestAnimationFrame(tick);
@@ -126,47 +135,56 @@ function LaneTest({vol,setScreen}){
   const startCam=async()=>{
     setErr("");
     try{
-      // задняя камера — смотрит вперёд на дорогу
       const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:480},height:{ideal:360}},audio:false});
       streamRef.current=s;
       if(videoRef.current){videoRef.current.srcObject=s;await videoRef.current.play().catch(()=>{});}
-      setPhase("setzone");
-    }catch(e){ setErr((e&&e.name?e.name+": ":"")+(e&&e.message||String(e))); setPhase("error"); }
+      setPhase("live");startTsRef.current=Date.now();loop();
+    }catch(e){setErr((e&&e.name?e.name+": ":"")+(e&&e.message||String(e)));setPhase("error");}
   };
   const stopAll=()=>{cancelAnimationFrame(rafRef.current);if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}};
   React.useEffect(()=>{startCam();return()=>stopAll();},[]);
 
-  // экран обводки: рисуем кадр + рамку
-  React.useEffect(()=>{
-    if(phase!=="setzone")return;
-    let raf;
-    const draw=()=>{
-      const c=setupRef.current,v=videoRef.current;
-      if(c){
-        const ctx=c.getContext("2d"),W=c.width,H=c.height;
-        if(v&&v.readyState>=2)ctx.drawImage(v,0,0,W,H);
-        else{ctx.fillStyle="#111";ctx.fillRect(0,0,W,H);ctx.fillStyle="#8a9bb0";ctx.font="14px sans-serif";ctx.textAlign="center";ctx.fillText("камера запускается…",W/2,H/2);ctx.textAlign="left";}
-        const z=drawing||zone;
-        if(z){
-          const x0=Math.min(z.x0,z.x1)*W,y0=Math.min(z.y0,z.y1)*H,rw=Math.abs(z.x1-z.x0)*W,rh=Math.abs(z.y1-z.y0)*H;
-          ctx.fillStyle="rgba(0,0,0,0.45)";
-          ctx.fillRect(0,0,W,y0);ctx.fillRect(0,y0+rh,W,H-(y0+rh));ctx.fillRect(0,y0,x0,rh);ctx.fillRect(x0+rw,y0,W-(x0+rw),rh);
-          ctx.strokeStyle="#4a9eff";ctx.lineWidth=3;ctx.strokeRect(x0,y0,rw,rh);
-          ctx.fillStyle="#4a9eff";ctx.font="bold 13px sans-serif";ctx.fillText("зона дороги (перед капотом)",x0+6,y0+18);
-        }
+  // ---- ДЕТЕКТОР ЛИНИЙ ПО ФОРМЕ ----
+  // для каждого столбца x в нижней трети считаем "оценку линии":
+  // сколько строк в этом столбце заметно СВЕТЛЕЕ, чем пиксели слева и справа
+  // от него (узкая светлая вертикальная черта = разметка, а не общий блик).
+  const detectLines=(img)=>{
+    const d=img.data;
+    // средняя яркость зоны
+    let sum=0,cnt=0;
+    for(let y=Z0;y<AH;y++)for(let x=0;x<AW;x++){const i=(y*AW+x)*4;sum+=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;cnt++;}
+    const mean=cnt?sum/cnt:0;
+    const GAP=4; // на сколько пикселей смотрим влево/вправо для контраста
+    const colScore=new Float32Array(AW);
+    for(let x=GAP;x<AW-GAP;x++){
+      let score=0;
+      for(let y=Z0;y<AH;y++){
+        const i=(y*AW+x)*4; const c=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+        const il=(y*AW+(x-GAP))*4, ir=(y*AW+(x+GAP))*4;
+        const cl=d[il]*0.299+d[il+1]*0.587+d[il+2]*0.114;
+        const cr=d[ir]*0.299+d[ir+1]*0.587+d[ir+2]*0.114;
+        // пиксель ярче окружения слева И справа (узкая светлая черта) и вообще светлый
+        if(c>cl+16 && c>cr+16 && c>mean+14) score++;
       }
-      raf=requestAnimationFrame(draw);
+      colScore[x]=score;
+    }
+    // порог: столбец считается "линией", если светлых-в-черте строк набралось достаточно
+    const zoneH=AH-Z0;
+    const need=Math.max(3,zoneH*0.35);
+    // ищем ЛЕВУЮ линию: сильнейший столбец в левой половине; ПРАВУЮ: в правой
+    let bestL=-1,bestLs=need, bestR=-1,bestRs=need;
+    const mid=AW/2;
+    for(let x=GAP;x<AW-GAP;x++){
+      if(colScore[x]<need) continue;
+      if(x<mid){ if(colScore[x]>bestLs){bestLs=colScore[x];bestL=x;} }
+      else { if(colScore[x]>bestRs){bestRs=colScore[x];bestR=x;} }
+    }
+    return {
+      lX: bestL>=0? bestL/AW : null,
+      rX: bestR>=0? bestR/AW : null,
+      colScore, need, mean
     };
-    raf=requestAnimationFrame(draw);
-    return()=>cancelAnimationFrame(raf);
-  },[phase,drawing,zone]);
-
-  const evtToNorm=(e,el)=>{const r=el.getBoundingClientRect();const t=e.touches?e.touches[0]:e;return{x:(t.clientX-r.left)/r.width,y:(t.clientY-r.top)/r.height};};
-  const onDown=(e)=>{const pt=evtToNorm(e,setupRef.current);setDrawing({x0:pt.x,y0:pt.y,x1:pt.x,y1:pt.y});};
-  const onMove=(e)=>{if(!drawing)return;const pt=evtToNorm(e,setupRef.current);setDrawing(d=>({...d,x1:pt.x,y1:pt.y}));};
-  const onUp=()=>{if(drawing){const z={x0:Math.min(drawing.x0,drawing.x1),y0:Math.min(drawing.y0,drawing.y1),x1:Math.max(drawing.x0,drawing.x1),y1:Math.max(drawing.y0,drawing.y1)};if((z.x1-z.x0)>0.1&&(z.y1-z.y0)>0.05){setZone(z);zoneRef.current=z;}setDrawing(null);}};
-  const confirmZone=()=>{setPhase("live");startTsRef.current=Date.now();loop();};
-  const resetZone=()=>{setZone(null);zoneRef.current=null;};
+  };
 
   const loop=()=>{
     const v=videoRef.current,raw=rawRef.current;
@@ -175,136 +193,126 @@ function LaneTest({vol,setScreen}){
       const rc=raw.getContext("2d",{willReadFrequently:true});
       rc.drawImage(v,0,0,AW,AH);
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
-      const z=zoneRef.current;
-      const clamp=(val,lo,hi)=>Math.max(lo,Math.min(hi,val));
-      const zx0=clamp(z?Math.floor(z.x0*AW):0,0,AW-1),zy0=clamp(z?Math.floor(z.y0*AH):0,0,AH-1);
-      const zx1=clamp(z?Math.ceil(z.x1*AW):AW,zx0+1,AW),zy1=clamp(z?Math.ceil(z.y1*AH):AH,zy0+1,AH);
-      // порог разметки: линии светлее асфальта. считаем среднее+контраст в зоне.
-      let lsum=0,lcnt=0,lmax=0;
-      if(img){const d=img.data;for(let y=zy0;y<zy1;y++)for(let x=zx0;x<zx1;x++){const i=(y*AW+x)*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;lsum+=lum;lcnt++;if(lum>lmax)lmax=lum;}}
-      const mean=lcnt?lsum/lcnt:0;
-      let th=mean+(lmax-mean)*0.5; th=Math.max(mean+18,th); th=Math.min(th,lmax-2);
-      if(!isFinite(th))th=150; thrRef.current=thrRef.current*0.5+th*0.5; if(!isFinite(thrRef.current))thrRef.current=150;
-      setAutoThr(Math.round(thrRef.current));
-      // ищем светлые пиксели (разметку) в НИЖНЕЙ части зоны (ближе к капоту = точнее)
-      const yLo=Math.floor(zy0+(zy1-zy0)*0.55), cx=(zx0+zx1)/2;
-      let leftSum=0,leftCnt=0,rightSum=0,rightCnt=0;
-      if(img){const d=img.data;
-        for(let y=yLo;y<zy1;y++)for(let x=zx0;x<zx1;x++){
-          const i=(y*AW+x)*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
-          if(lum>=thrRef.current){ if(x<cx){leftSum+=x;leftCnt++;} else {rightSum+=x;rightCnt++;} }
-        }
-      }
-      const zw=Math.max(1,zx1-zx0);
-      const lX=leftCnt>=2?((leftSum/leftCnt-zx0)/zw):null;
-      const rX=rightCnt>=2?((rightSum/rightCnt-zx0)/zw):null;
-      setLeftX(lX);setRightX(rX);
-      // центр полосы = середина между линиями; смещение = насколько центр кадра ушёл от центра полосы
-      let cen=0.5, off=0, haveLane=false;
-      if(lX!=null&&rX!=null){ cen=(lX+rX)/2; off=0.5-cen; haveLane=true; }
-      else if(lX!=null){ off=(0.30 - lX); haveLane=true; } // только левая: держим дистанцию слева
-      else if(rX!=null){ off=(rX - 0.70); haveLane=true; }
-      setCenter(cen);setOffset(off);
-      offEmaRef.current=offEmaRef.current*0.7+off*0.3;
+      let res={lX:null,rX:null,colScore:null,need:0,mean:0};
+      if(img) res=detectLines(img);
+      // сглаживание позиций
+      if(res.lX!=null) leftXRef.current = leftXRef.current==null?res.lX:leftXRef.current*0.6+res.lX*0.4;
+      else leftXRef.current=null;
+      if(res.rX!=null) rightXRef.current = rightXRef.current==null?res.rX:rightXRef.current*0.6+res.rX*0.4;
+      else rightXRef.current=null;
+      setLeftX(leftXRef.current);setRightX(rightXRef.current);
 
-      // ТРЕВОГА: центр ушёл далеко от полосы И поворотник НЕ включён
-      const drift=Math.abs(offEmaRef.current);
+      // калибровка: пока держишь кнопку — записываем текущую позицию линии как границу
+      if(holdLRef.current && leftXRef.current!=null){ calLRef.current=leftXRef.current; setCalL(leftXRef.current); }
+      if(holdRRef.current && rightXRef.current!=null){ calRRef.current=rightXRef.current; setCalR(rightXRef.current); }
+
+      // ТРЕВОГА: линия подошла к калиброванной границе "я на линии" и поворотник не включён
       const blink=blinkerRef.current;
-      let stage=0;
-      if(haveLane && !blink){
-        if(drift>0.14) stage=1;   // лёгкий увод -> писк
-        if(drift>0.24) stage=2;   // сильный -> тревога
+      let stage=0, side="";
+      if(!blink){
+        // левая: если текущая левая линия сместилась ВПРАВО к калибровке (наезжаешь на неё)
+        if(calLRef.current!=null && leftXRef.current!=null && leftXRef.current>=calLRef.current-0.02){ stage=2; side="L"; }
+        else if(calLRef.current!=null && leftXRef.current!=null && leftXRef.current>=calLRef.current-0.06){ stage=1; side="L"; }
+        if(calRRef.current!=null && rightXRef.current!=null && rightXRef.current<=calRRef.current+0.02){ stage=2; side="R"; }
+        else if(calRRef.current!=null && rightXRef.current!=null && rightXRef.current<=calRRef.current+0.06){ if(stage<1){stage=1;side="R";} }
       }
-      if(stage>=2 && !alarmRef.current){ alarmRef.current=true; setAlarm(true); beep(950,180,vol*0.6); setTimeout(()=>beep(950,180,vol*0.6),220); setTimeout(()=>beep(950,180,vol*0.6),440); }
-      else if(stage===1 && !alarmRef.current){ beep(800,120,vol*0.4); }
+      if(stage>=2 && !alarmRef.current){ alarmRef.current=true; setAlarm(true); beep(950,180,vol*0.6); setTimeout(()=>beep(950,180,vol*0.6),220); }
+      else if(stage===1 && !alarmRef.current){ beep(800,110,vol*0.4); }
       else if(stage===0 && alarmRef.current){ alarmRef.current=false; setAlarm(false); }
 
-      // отрисовка HUD
+      // HUD
       const view=viewRef.current;
       if(view){
         const vc=view.getContext("2d"),VW=view.width,VH=view.height;
         vc.drawImage(v,0,0,VW,VH);
-        if(z){vc.strokeStyle="rgba(74,158,255,0.5)";vc.lineWidth=2;vc.strokeRect(z.x0*VW,z.y0*VH,(z.x1-z.x0)*VW,(z.y1-z.y0)*VH);}
-        // подсветка найденной разметки
-        if(img){vc.fillStyle="rgba(0,232,255,0.55)";const sx=VW/AW,sy=VH/AH,d=img.data;
-          for(let y=yLo;y<zy1;y++)for(let x=zx0;x<zx1;x++){const i=(y*AW+x)*4;const lum=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;if(lum>=thrRef.current)vc.fillRect(x*sx,y*sy,sx,sy);}}
-        // линии
-        if(lX!=null){const px=(zx0/AW+lX*(zw/AW))*VW;vc.strokeStyle="#ffd23f";vc.lineWidth=3;vc.beginPath();vc.moveTo(px,z.y0*VH);vc.lineTo(px,z.y1*VH);vc.stroke();}
-        if(rX!=null){const px=(zx0/AW+rX*(zw/AW))*VW;vc.strokeStyle="#fff";vc.lineWidth=3;vc.beginPath();vc.moveTo(px,z.y0*VH);vc.lineTo(px,z.y1*VH);vc.stroke();}
-        // центр кадра (где машина)
-        vc.strokeStyle="rgba(0,232,122,0.9)";vc.lineWidth=2;vc.setLineDash([6,6]);vc.beginPath();vc.moveTo(VW/2,z?z.y0*VH:0);vc.lineTo(VW/2,z?z.y1*VH:VH);vc.stroke();vc.setLineDash([]);
+        // граница зоны (нижняя треть)
+        const zy=Z0/AH*VH;
+        vc.strokeStyle="rgba(74,158,255,0.4)";vc.lineWidth=1;vc.beginPath();vc.moveTo(0,zy);vc.lineTo(VW,zy);vc.stroke();
+        vc.fillStyle="rgba(74,158,255,0.6)";vc.font="11px sans-serif";vc.fillText("зона дороги ↓",6,zy+13);
+        // подсветка колонок-линий
+        if(res.colScore){const sx=VW/AW;
+          for(let x=0;x<AW;x++){ if(res.colScore[x]>=res.need){ vc.fillStyle="rgba(0,232,255,0.35)"; vc.fillRect(x*sx,zy,sx,VH-zy);} }
+        }
+        if(leftXRef.current!=null){const px=leftXRef.current*VW;vc.strokeStyle="#ffd23f";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
+        if(rightXRef.current!=null){const px=rightXRef.current*VW;vc.strokeStyle="#fff";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
+        // калибр. границы (красные)
+        if(calLRef.current!=null){const px=calLRef.current*VW;vc.strokeStyle="rgba(255,80,80,0.8)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
+        if(calRRef.current!=null){const px=calRRef.current*VW;vc.strokeStyle="rgba(255,80,80,0.8)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
       }
 
-      logRef.current.push({t:Date.now()-startTsRef.current,lX:lX!=null?+lX.toFixed(3):null,rX:rX!=null?+rX.toFixed(3):null,off:+off.toFixed(3),offEma:+offEmaRef.current.toFixed(3),blink:blink?1:0,stage,thr:Math.round(thrRef.current)});
+      logRef.current.push({t:Date.now()-startTsRef.current,lX:leftXRef.current!=null?+leftXRef.current.toFixed(3):null,rX:rightXRef.current!=null?+rightXRef.current.toFixed(3):null,calL:calLRef.current,calR:calRRef.current,blink:blink?1:0,stage,side});
       setRecN(logRef.current.length);
     }
-    rafRef.current=requestAnimationFrame(()=>setTimeout(loop,90)); // ~10 к/с
+    rafRef.current=requestAnimationFrame(()=>setTimeout(loop,90));
   };
 
   const download=()=>{
-    const out={meta:{app:"Antison-LaneTest",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,zone:zoneRef.current,samples:logRef.current.length},rows:logRef.current};
+    const out={meta:{app:"Antison-LaneTest",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,calL:calLRef.current,calR:calRRef.current,samples:logRef.current.length},rows:logRef.current};
     const blob=new Blob([JSON.stringify(out,null,1)],{type:"application/json"});
     const url=URL.createObjectURL(blob),a=document.createElement("a");
     a.href=url;a.download="antison_lane_"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
     document.body.appendChild(a);a.click();setTimeout(()=>{document.body.removeChild(a);URL.revokeObjectURL(url);},400);
   };
 
+  const pressL=(v)=>{holdLRef.current=v;setHoldL(v);};
+  const pressR=(v)=>{holdRRef.current=v;setHoldR(v);};
+  const clearCal=()=>{calLRef.current=null;calRRef.current=null;setCalL(null);setCalR(null);};
+
+  if(phase==="error") return (
+    <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
+      <video ref={videoRef} playsInline muted autoPlay style={{display:"none"}}/>
+      <div style={{color:"#ff6666",fontSize:"15px",marginBottom:"10px"}}>Камера не открылась</div>
+      <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"16px"}}>{err}</div>
+      <button onClick={()=>{stopAll();setScreen("home");}} style={{padding:"12px 20px",borderRadius:"12px",border:"1px solid #4a9eff",background:"rgba(74,158,255,0.12)",color:"#9fcfff"}}>Назад</button>
+    </div>
+  );
+
   return (
    <React.Fragment>
     <video ref={videoRef} playsInline muted autoPlay style={{display:"none"}}/>
     <canvas ref={rawRef} width={AW} height={AH} style={{display:"none"}}/>
 
-    {phase==="error"&&(
-      <div style={{height:"100%",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"24px",textAlign:"center"}}>
-        <div style={{color:"#ff6666",fontSize:"15px",marginBottom:"10px"}}>Камера не открылась</div>
-        <div className="mono" style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"16px"}}>{err}</div>
-        <button onClick={()=>{stopAll();setScreen("home");}} style={{padding:"12px 20px",borderRadius:"12px",border:"1px solid #4a9eff",background:"rgba(74,158,255,0.12)",color:"#9fcfff"}}>Назад</button>
-      </div>
-    )}
-
-    {phase==="setzone"&&(
-      <div style={{height:"100%",background:"#000",display:"flex",flexDirection:"column",padding:"12px",justifyContent:"center"}}>
-        <div style={{fontSize:"15px",color:"#fff",fontWeight:700,marginBottom:"6px",textAlign:"center"}}>Обведи зону дороги перед капотом</div>
-        <div style={{fontSize:"12px",color:"#8a9bb0",marginBottom:"10px",textAlign:"center"}}>Телефон смотрит задней камерой вперёд. Обведи участок дороги с разметкой прямо перед машиной.</div>
-        <canvas ref={setupRef} width={320} height={240}
-          onTouchStart={onDown} onTouchMove={onMove} onTouchEnd={onUp}
-          onMouseDown={onDown} onMouseMove={onMove} onMouseUp={onUp}
-          style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",background:"#000",touchAction:"none",display:"block"}}/>
-        <div style={{display:"flex",gap:"8px",marginTop:"12px"}}>
-          <button onClick={resetZone} style={{flex:1,padding:"14px",borderRadius:"12px",border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.85)",color:"#c0c8d4",fontSize:"15px",fontWeight:700}}>↺ Заново</button>
-          <button onClick={confirmZone} disabled={!zone} style={{flex:2,padding:"14px",borderRadius:"12px",border:"1px solid #4a9eff",background:zone?"linear-gradient(135deg,#0d233a,#163558)":"rgba(20,24,34,0.5)",color:zone?"#9fcfff":"#556",fontSize:"16px",fontWeight:800}}>✓ Готово, начать</button>
-        </div>
-      </div>
-    )}
-
-    {phase==="live"&&(
     <div style={{height:"100%",position:"relative",background:"#000",overflow:"hidden"}}>
-      <div style={{position:"absolute",top:12,left:14,zIndex:5}}>
+      <div style={{position:"absolute",top:10,left:14,zIndex:5}}>
         <div className="mono" style={{fontSize:"20px",fontWeight:900,color:"#fff"}}>ПОЛОСА {VER}</div>
-        <div style={{fontSize:"15px",fontWeight:800,marginTop:"3px",color:(leftX!=null||rightX!=null)?"#00e87a":"#ffb84a"}}>{(leftX!=null||rightX!=null)?"✓ вижу разметку":"⋯ ищу разметку"}{blinker?" · 🔄 поворотник":""}</div>
+        <div style={{fontSize:"15px",fontWeight:800,marginTop:"2px",color:(leftX!=null||rightX!=null)?"#00e87a":"#ffb84a"}}>{(leftX!=null||rightX!=null)?"✓ вижу линии":"⋯ ищу линии"}{blinker?" · 🔄 поворотник":""}</div>
       </div>
-      <div style={{position:"absolute",top:12,right:14,zIndex:5,textAlign:"right"}}>
-        <div className="mono" style={{fontSize:"22px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"}<span style={{fontSize:"11px",color:"#8a9bb0"}}> mph</span></div>
+      <div style={{position:"absolute",top:10,right:14,zIndex:5,textAlign:"right"}}>
+        <div className="mono" style={{fontSize:"20px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"}<span style={{fontSize:"11px",color:"#8a9bb0"}}> mph</span></div>
         <div className="mono" style={{fontSize:"13px",color:"#8a9bb0"}}>{clock}</div>
       </div>
 
-      <div style={{position:"absolute",top:"64px",left:"12px",right:"12px",zIndex:4}}>
+      <div style={{position:"absolute",top:"58px",left:"10px",right:"10px",zIndex:4}}>
         <canvas ref={viewRef} width={320} height={240} style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
-        <div className="mono" style={{fontSize:"15px",color:"#a8b4c4",marginTop:"8px",textAlign:"center"}}>смещение:{(offset*100).toFixed(0)} · порог:{autoThr} · лог:{recN}</div>
+        <div className="mono" style={{fontSize:"14px",color:"#a8b4c4",marginTop:"6px",textAlign:"center"}}>
+          {calL!=null||calR!=null?"калибровка задана ✓":"наезжай на линию и держи кнопку для калибровки"} · лог:{recN}
+        </div>
       </div>
 
       {alarm&&(
-        <div style={{position:"absolute",inset:0,zIndex:30,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",background:"rgba(150,0,0,0.55)",pointerEvents:"none"}}>
-          <div style={{fontSize:"40px",fontWeight:900,color:"#fff"}}>⚠ УХОДИШЬ С ПОЛОСЫ</div>
+        <div style={{position:"absolute",top:"58px",left:"10px",right:"10px",zIndex:8,display:"flex",alignItems:"center",justifyContent:"center",pointerEvents:"none"}}>
+          <div style={{marginTop:"90px",background:"rgba(150,0,0,0.85)",color:"#fff",fontSize:"26px",fontWeight:900,padding:"14px 22px",borderRadius:"14px"}}>⚠ ПОКИНУЛ ПОЛОСУ</div>
         </div>
       )}
 
-      <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"10px 12px 16px",display:"flex",gap:"8px"}}>
-        <button onClick={download} style={{flex:1,padding:"14px",borderRadius:"12px",fontSize:"14px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог</button>
-        <button onClick={()=>{stopAll();setScreen("home");}} style={{flex:1,padding:"14px",borderRadius:"12px",fontSize:"14px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
+      {/* калибровочные кнопки */}
+      <div style={{position:"absolute",bottom:"74px",left:0,right:0,zIndex:6,padding:"0 10px",display:"flex",gap:"8px"}}>
+        <button
+          onTouchStart={(e)=>{e.preventDefault();pressL(true);}} onTouchEnd={()=>pressL(false)}
+          onMouseDown={()=>pressL(true)} onMouseUp={()=>pressL(false)} onMouseLeave={()=>pressL(false)}
+          style={{flex:1,padding:"16px",borderRadius:"12px",fontSize:"14px",fontWeight:800,border:holdL?"2px solid #ffd23f":"1px solid rgba(255,210,63,0.5)",background:holdL?"rgba(255,210,63,0.25)":"rgba(20,24,34,0.9)",color:"#ffd23f"}}>◀ держи: НА ЛИНИИ СЛЕВА</button>
+        <button
+          onTouchStart={(e)=>{e.preventDefault();pressR(true);}} onTouchEnd={()=>pressR(false)}
+          onMouseDown={()=>pressR(true)} onMouseUp={()=>pressR(false)} onMouseLeave={()=>pressR(false)}
+          style={{flex:1,padding:"16px",borderRadius:"12px",fontSize:"14px",fontWeight:800,border:holdR?"2px solid #fff":"1px solid rgba(255,255,255,0.5)",background:holdR?"rgba(255,255,255,0.22)":"rgba(20,24,34,0.9)",color:"#fff"}}>НА ЛИНИИ СПРАВА: держи ▶</button>
+      </div>
+
+      <div style={{position:"absolute",bottom:0,left:0,right:0,zIndex:6,padding:"8px 10px 14px",display:"flex",gap:"8px"}}>
+        <button onClick={clearCal} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>↺ Сброс калибр.</button>
+        <button onClick={download} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог</button>
+        <button onClick={()=>{stopAll();setScreen("home");}} style={{flex:1,padding:"12px",borderRadius:"12px",fontSize:"13px",fontWeight:700,border:"1px solid #ff4444",background:"rgba(255,68,68,0.15)",color:"#ff8888"}}>■ Стоп</button>
       </div>
     </div>
-    )}
    </React.Fragment>
   );
 }
