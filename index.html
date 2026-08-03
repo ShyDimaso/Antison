@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v11";
+const VER="v12";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -120,8 +120,8 @@ function LaneTest({vol,setScreen}){
   const spokeStepRef=React.useRef(-1);   // чтобы говорить каждый шаг один раз
   const AW=96,AH=72;
   const Z0=Math.floor(AH*0.60);
-  const HOLD_CENTER=12000; // мс держать центр
-  const HOLD_SIDE=6000;    // мс держать прижатым к линии
+  const HOLD_CENTER=8000; // мс держать центр
+  const HOLD_SIDE=3000;    // мс держать прижатым к линии
   const HOLD_RET=2500;     // мс держать возврат в центр
 
   const say=(text)=>{ try{ speechSynthesis.cancel(); const u=new SpeechSynthesisUtterance(text); u.lang="ru-RU"; u.rate=1.0; speechSynthesis.speak(u); }catch(e){} };
@@ -188,12 +188,12 @@ function LaneTest({vol,setScreen}){
       // сказать подсказку шага один раз при входе в шаг
       if(step!==spokeStepRef.current && step>=1 && step<=6){
         spokeStepRef.current=step;
-        if(step===1) say("Выберите прямой участок дороги. Едьте ровно по центру полосы, не наезжайте на линии.");
-        if(step===2) say("Смотрите в левое боковое зеркало. Аккуратно прижмитесь к левой линии, максимально близко, но не наезжайте на неё.");
-        if(step===3) say("Хорошо. Вернитесь в центр полосы.");
-        if(step===4) say("Смотрите в правое боковое зеркало. Аккуратно прижмитесь к правой линии, максимально близко, но не наезжайте.");
-        if(step===5) say("Хорошо. Вернитесь в центр полосы.");
-        if(step===6) say("Калибровка окончена. Нажмите Старт, чтобы включить контроль полосы.");
+        if(step===1) say("Едем ровно по центру полосы. Держись середины, я запоминаю.");
+        if(step===2) say("Хорошо. Теперь плавно прижмись к левой линии. Смотри в левое зеркало, близко, но не наезжай.");
+        if(step===3) say("Отлично. Вернись в центр.");
+        if(step===4) say("Теперь плавно к правой линии. Смотри в правое зеркало.");
+        if(step===5) say("Хорошо. Возвращайся в центр.");
+        if(step===6) say("Готово, всё записал. Нажми Старт, чтобы включить контроль полосы.");
       }
 
       // ---- машина калибровки: держим НУЖНОЕ состояние N секунд ----
@@ -207,13 +207,16 @@ function LaneTest({vol,setScreen}){
           calStepRef.current=2;setCalStep(2);holdMsRef.current=0;bufRef.current=[];
         }
       }
-      else if(step===2){ // прижат влево: левая линия ЗАМЕТНО правее (ближе к центру), чем в центре
-        const pressed = (lX!=null && cCenterL.current!=null && lX>cCenterL.current+0.05);
-        if(pressed){ holdMsRef.current+=DT; bufRef.current.push(lX); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT); }
+      else if(step===2){ // прижат влево: машина сместилась влево -> центр полосы в кадре уехал ВПРАВО
+        const curCenter = haveBoth ? (lX+rX)/2 : (lX!=null? lX+0.19 : null);
+        const baseCenter = (cCenterL.current+cCenterR.current)/2;
+        const pressed = (curCenter!=null && curCenter > baseCenter+0.04);
+        if(pressed){ holdMsRef.current+=DT; bufRef.current.push(lX!=null?lX:baseCenter*0.4); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT*0.5); }
         setHoldPct(Math.min(100,Math.round(holdMsRef.current/HOLD_SIDE*100)));
-        if(holdMsRef.current>=HOLD_SIDE && bufRef.current.length>15){
-          const sorted=bufRef.current.slice().sort((a,b)=>b-a); cLeftLim.current=sorted[Math.floor(sorted.length*0.2)];
-          say("Левый край записан."); calStepRef.current=3;setCalStep(3);holdMsRef.current=0;bufRef.current=[];
+        if(holdMsRef.current>=HOLD_SIDE && bufRef.current.length>8){
+          // левый предел = самое КРАЙНЕЕ левое положение левой линии (минимум) когда прижат
+          const sorted=bufRef.current.slice().sort((a,b)=>a-b); cLeftLim.current=sorted[Math.floor(sorted.length*0.2)];
+          say("Вижу, ты у левой линии. Записал."); calStepRef.current=3;setCalStep(3);holdMsRef.current=0;bufRef.current=[];
         }
       }
       else if(step===3){ // возврат в центр
@@ -222,13 +225,16 @@ function LaneTest({vol,setScreen}){
         setHoldPct(Math.min(100,Math.round(holdMsRef.current/HOLD_RET*100)));
         if(holdMsRef.current>=HOLD_RET){ calStepRef.current=4;setCalStep(4);holdMsRef.current=0;bufRef.current=[]; }
       }
-      else if(step===4){ // прижат вправо: правая линия заметно левее
-        const pressed = (rX!=null && cCenterR.current!=null && rX<cCenterR.current-0.05);
-        if(pressed){ holdMsRef.current+=DT; bufRef.current.push(rX); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT); }
+      else if(step===4){ // прижат вправо: машина сместилась вправо -> центр полосы уехал ВЛЕВО
+        const curCenter = haveBoth ? (lX+rX)/2 : (rX!=null? rX-0.19 : null);
+        const baseCenter = (cCenterL.current+cCenterR.current)/2;
+        const pressed = (curCenter!=null && curCenter < baseCenter-0.04);
+        if(pressed){ holdMsRef.current+=DT; bufRef.current.push(rX!=null?rX:baseCenter+0.4); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT*0.5); }
         setHoldPct(Math.min(100,Math.round(holdMsRef.current/HOLD_SIDE*100)));
-        if(holdMsRef.current>=HOLD_SIDE && bufRef.current.length>15){
-          const sorted=bufRef.current.slice().sort((a,b)=>a-b); cRightLim.current=sorted[Math.floor(sorted.length*0.2)];
-          say("Правый край записан."); calStepRef.current=5;setCalStep(5);holdMsRef.current=0;bufRef.current=[];
+        if(holdMsRef.current>=HOLD_SIDE && bufRef.current.length>8){
+          // правый предел = самое КРАЙНЕЕ правое положение правой линии (максимум) когда прижат
+          const sorted=bufRef.current.slice().sort((a,b)=>b-a); cRightLim.current=sorted[Math.floor(sorted.length*0.2)];
+          say("Вижу, ты у правой линии. Записал."); calStepRef.current=5;setCalStep(5);holdMsRef.current=0;bufRef.current=[];
         }
       }
       else if(step===5){ // возврат в центр
