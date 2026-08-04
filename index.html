@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v19";
+const VER="v20";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -184,9 +184,16 @@ function LaneTest({vol,setScreen}){
     for(let y=Z0;y<H;y++){for(let x=STEP;x<W-STEP-MAXW;x++){const g=gray[y*W+x+STEP]-gray[y*W+x-STEP];if(g>EDGE){for(let w=2;w<=MAXW;w++){const g2=gray[y*W+x+w+STEP]-gray[y*W+x+w-STEP];if(g2<-EDGE){colVote[x+Math.floor(w/2)]+=1;break;}}}}}
     const need=Math.max(2,zoneH*0.12);const sm=new Float32Array(W);
     for(let x=1;x<W-1;x++)sm[x]=colVote[x-1]*0.5+colVote[x]+colVote[x+1]*0.5;
-    let bestL=-1,bestLs=need,bestR=-1,bestRs=need;const mid=W/2;
-    for(let x=2;x<W-2;x++){if(sm[x]<need)continue;if(x<mid){if(sm[x]>bestLs){bestLs=sm[x];bestL=x;}}else{if(sm[x]>bestRs){bestRs=sm[x];bestR=x;}}}
-    return {lX:bestL>=0?bestL/W:null,rX:bestR>=0?bestR/W:null,sm,need};
+    // собираем ВСЕ пики-линии (локальные максимумы выше порога)
+    const peaks=[];
+    for(let x=2;x<W-2;x++){
+      if(sm[x]<need) continue;
+      if(sm[x]>=sm[x-1] && sm[x]>=sm[x+1]){
+        if(peaks.length && x-peaks[peaks.length-1].x<3){ if(sm[x]>peaks[peaks.length-1].s) peaks[peaks.length-1]={x:x,s:sm[x]}; }
+        else peaks.push({x:x,s:sm[x]});
+      }
+    }
+    return {peaks:peaks.map(p=>({x:p.x/W,s:p.s})), sm, need};
   };
 
   const beginStep=(st)=>{calStepRef.current=st;setCalStep(st);bufL.current=[];bufR.current=[];
@@ -218,12 +225,36 @@ function LaneTest({vol,setScreen}){
       const rc=raw.getContext("2d",{willReadFrequently:true});
       rc.drawImage(v,0,0,AW,AH);
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
-      let res={lX:null,rX:null,sm:null,need:0};
+      let res={peaks:[],sm:null,need:0};
       if(img)res=detect(img);
-      // сглаживание + удержание пропавшей линии на HOLD_LOST кадров
-      if(res.lX!=null){leftXRef.current=leftXRef.current==null?res.lX:leftXRef.current*0.7+res.lX*0.3;lMissRef.current=0;}
+      const peaks=res.peaks||[];
+      // ВЫБОР МОИХ ЛИНИЙ: держимся за ту же линию, что вели раньше (ближайший пик к прошлой позиции),
+      // а не "что левее/правее середины экрана". Так столбики и дальние полосы не собьют.
+      const pickNear=(prev,exclude)=>{
+        if(!peaks.length) return null;
+        let best=null,bd=1e9;
+        for(const p of peaks){
+          if(exclude!=null && Math.abs(p.x-exclude)<0.03) continue;
+          const d=prev==null? 1e8-p.s : Math.abs(p.x-prev);
+          if(prev!=null && d>0.12) continue; // слишком далеко — это другая линия
+          if(d<bd){bd=d;best=p.x;}
+        }
+        return best;
+      };
+      let newL=null,newR=null;
+      const prevL=leftXRef.current, prevR=rightXRef.current;
+      if(prevL!=null||prevR!=null){
+        newL=pickNear(prevL,null);
+        newR=pickNear(prevR,newL);
+      } else {
+        // первый кадр / после сброса: берём две самые сильные линии, левее и правее
+        const sorted=peaks.slice().sort((a,b)=>b.s-a.s).slice(0,4).sort((a,b)=>a.x-b.x);
+        if(sorted.length>=2){ newL=sorted[0].x; newR=sorted[sorted.length-1].x; }
+        else if(sorted.length===1){ if(sorted[0].x<0.5) newL=sorted[0].x; else newR=sorted[0].x; }
+      }
+      if(newL!=null){leftXRef.current=prevL==null?newL:prevL*0.7+newL*0.3;lMissRef.current=0;}
       else{lMissRef.current++;if(lMissRef.current>HOLD_LOST)leftXRef.current=null;}
-      if(res.rX!=null){rightXRef.current=rightXRef.current==null?res.rX:rightXRef.current*0.7+res.rX*0.3;rMissRef.current=0;}
+      if(newR!=null){rightXRef.current=prevR==null?newR:prevR*0.7+newR*0.3;rMissRef.current=0;}
       else{rMissRef.current++;if(rMissRef.current>HOLD_LOST)rightXRef.current=null;}
       setLeftX(leftXRef.current);setRightX(rightXRef.current);
       const lX=leftXRef.current,rX=rightXRef.current;
