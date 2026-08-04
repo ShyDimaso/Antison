@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v20";
+const VER="v21";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -148,7 +148,9 @@ function LaneTest({vol,setScreen}){
   const measuringRef=React.useRef(false);
   const onLineMsRef=React.useRef(0);
   const AW=96,AH=72;
-  const Z0=Math.floor(AH*0.45);
+  const Z_FAR=Math.floor(AH*0.50);   // дальняя часть: смотрим для подтверждения линии
+  const Z_NEAR=Math.floor(AH*0.80);  // БЛИЖНЯЯ у капота: по ней меряем съезд с полосы
+  const Z0=Z_FAR;
   const MEASURE_MS=20000;
   const HOLD_LOST=10; // сколько кадров держим пропавшую линию
 
@@ -180,9 +182,18 @@ function LaneTest({vol,setScreen}){
     const d=img.data,W=AW,H=AH;
     const gray=new Float32Array(W*H);
     for(let y=Z0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;gray[y*W+x]=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;}
-    const zoneH=H-Z0;const colVote=new Float32Array(W);const STEP=2,EDGE=4,MAXW=10;
-    for(let y=Z0;y<H;y++){for(let x=STEP;x<W-STEP-MAXW;x++){const g=gray[y*W+x+STEP]-gray[y*W+x-STEP];if(g>EDGE){for(let w=2;w<=MAXW;w++){const g2=gray[y*W+x+w+STEP]-gray[y*W+x+w-STEP];if(g2<-EDGE){colVote[x+Math.floor(w/2)]+=1;break;}}}}}
-    const need=Math.max(2,zoneH*0.12);const sm=new Float32Array(W);
+    const STEP=2,EDGE=4,MAXW=10;
+    const voteNear=new Float32Array(W), voteFar=new Float32Array(W);
+    for(let y=Z_FAR;y<H;y++){
+      const near = y>=Z_NEAR;
+      for(let x=STEP;x<W-STEP-MAXW;x++){
+        const g=gray[y*W+x+STEP]-gray[y*W+x-STEP];
+        if(g>EDGE){ for(let w=2;w<=MAXW;w++){ const g2=gray[y*W+x+w+STEP]-gray[y*W+x+w-STEP];
+          if(g2<-EDGE){ const c=x+Math.floor(w/2); if(near) voteNear[c]+=1; else voteFar[c]+=1; break; } } }
+      }
+    }
+    const zoneH=H-Z_NEAR;const colVote=voteNear;
+    const need=Math.max(2,zoneH*0.30);const sm=new Float32Array(W);
     for(let x=1;x<W-1;x++)sm[x]=colVote[x-1]*0.5+colVote[x]+colVote[x+1]*0.5;
     // собираем ВСЕ пики-линии (локальные максимумы выше порога)
     const peaks=[];
@@ -193,7 +204,13 @@ function LaneTest({vol,setScreen}){
         else peaks.push({x:x,s:sm[x]});
       }
     }
-    return {peaks:peaks.map(p=>({x:p.x/W,s:p.s})), sm, need};
+    // дальние пики — подтверждают, что это настоящая линия дороги (тянется вдаль), а не пятно
+    const smF=new Float32Array(W);
+    for(let x=1;x<W-1;x++) smF[x]=voteFar[x-1]*0.5+voteFar[x]+voteFar[x+1]*0.5;
+    const needF=Math.max(2,(Z_NEAR-Z_FAR)*0.25);
+    const farPeaks=[];
+    for(let x=2;x<W-2;x++){ if(smF[x]<needF) continue; if(smF[x]>=smF[x-1]&&smF[x]>=smF[x+1]) farPeaks.push(x/W); }
+    return {peaks:peaks.map(p=>({x:p.x/W,s:p.s})), farPeaks, sm, need};
   };
 
   const beginStep=(st)=>{calStepRef.current=st;setCalStep(st);bufL.current=[];bufR.current=[];
@@ -339,8 +356,10 @@ function LaneTest({vol,setScreen}){
       if(view){
         const vc=view.getContext("2d"),VW=view.width,VH=view.height;
         vc.drawImage(v,0,0,VW,VH);
-        const zy=Z0/AH*VH;
-        vc.strokeStyle="rgba(74,158,255,0.4)";vc.lineWidth=1;vc.beginPath();vc.moveTo(0,zy);vc.lineTo(VW,zy);vc.stroke();
+        const zy=Z_FAR/AH*VH, zyN=Z_NEAR/AH*VH;
+        vc.strokeStyle="rgba(74,158,255,0.35)";vc.lineWidth=1;vc.beginPath();vc.moveTo(0,zy);vc.lineTo(VW,zy);vc.stroke();
+        vc.strokeStyle="rgba(0,232,122,0.85)";vc.lineWidth=2;vc.beginPath();vc.moveTo(0,zyN);vc.lineTo(VW,zyN);vc.stroke();
+        vc.fillStyle="rgba(0,232,122,0.9)";vc.font="bold 11px sans-serif";vc.fillText("контроль здесь ↓",6,zyN-5);
         if(res.sm){const sx=VW/AW;for(let x=0;x<AW;x++){if(res.sm[x]>=res.need){vc.fillStyle="rgba(0,232,255,0.4)";vc.fillRect(x*sx,zy,sx,VH-zy);}}}
         if(lX!=null){const px=lX*VW;vc.strokeStyle="#ffd23f";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
         if(rX!=null){const px=rX*VW;vc.strokeStyle="#fff";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
