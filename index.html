@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v12";
+const VER="v13";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -207,16 +207,13 @@ function LaneTest({vol,setScreen}){
           calStepRef.current=2;setCalStep(2);holdMsRef.current=0;bufRef.current=[];
         }
       }
-      else if(step===2){ // прижат влево: машина сместилась влево -> центр полосы в кадре уехал ВПРАВО
-        const curCenter = haveBoth ? (lX+rX)/2 : (lX!=null? lX+0.19 : null);
-        const baseCenter = (cCenterL.current+cCenterR.current)/2;
-        const pressed = (curCenter!=null && curCenter > baseCenter+0.04);
-        if(pressed){ holdMsRef.current+=DT; bufRef.current.push(lX!=null?lX:baseCenter*0.4); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT*0.5); }
+      else if(step===2){ // прижат влево: левая линия уходит ВЛЕВО (lX уменьшается)
+        const moved = (lX!=null && cCenterL.current!=null && lX < cCenterL.current-0.03);
+        if(moved){ holdMsRef.current+=DT; bufRef.current.push(lX); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT*0.5); }
         setHoldPct(Math.min(100,Math.round(holdMsRef.current/HOLD_SIDE*100)));
         if(holdMsRef.current>=HOLD_SIDE && bufRef.current.length>8){
-          // левый предел = самое КРАЙНЕЕ левое положение левой линии (минимум) когда прижат
-          const sorted=bufRef.current.slice().sort((a,b)=>a-b); cLeftLim.current=sorted[Math.floor(sorted.length*0.2)];
-          say("Вижу, ты у левой линии. Записал."); calStepRef.current=3;setCalStep(3);holdMsRef.current=0;bufRef.current=[];
+          cLeftLim.current=Math.min.apply(null,bufRef.current);
+          say("Вижу, ты у левой. Записал левый край."); calStepRef.current=3;setCalStep(3);holdMsRef.current=0;bufRef.current=[];
         }
       }
       else if(step===3){ // возврат в центр
@@ -225,16 +222,13 @@ function LaneTest({vol,setScreen}){
         setHoldPct(Math.min(100,Math.round(holdMsRef.current/HOLD_RET*100)));
         if(holdMsRef.current>=HOLD_RET){ calStepRef.current=4;setCalStep(4);holdMsRef.current=0;bufRef.current=[]; }
       }
-      else if(step===4){ // прижат вправо: машина сместилась вправо -> центр полосы уехал ВЛЕВО
-        const curCenter = haveBoth ? (lX+rX)/2 : (rX!=null? rX-0.19 : null);
-        const baseCenter = (cCenterL.current+cCenterR.current)/2;
-        const pressed = (curCenter!=null && curCenter < baseCenter-0.04);
-        if(pressed){ holdMsRef.current+=DT; bufRef.current.push(rX!=null?rX:baseCenter+0.4); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT*0.5); }
+      else if(step===4){ // прижат вправо: левая линия уходит ВПРАВО (lX увеличивается)
+        const moved = (lX!=null && cCenterL.current!=null && lX > cCenterL.current+0.03);
+        if(moved){ holdMsRef.current+=DT; bufRef.current.push(lX); } else { holdMsRef.current=Math.max(0,holdMsRef.current-DT*0.5); }
         setHoldPct(Math.min(100,Math.round(holdMsRef.current/HOLD_SIDE*100)));
         if(holdMsRef.current>=HOLD_SIDE && bufRef.current.length>8){
-          // правый предел = самое КРАЙНЕЕ правое положение правой линии (максимум) когда прижат
-          const sorted=bufRef.current.slice().sort((a,b)=>b-a); cRightLim.current=sorted[Math.floor(sorted.length*0.2)];
-          say("Вижу, ты у правой линии. Записал."); calStepRef.current=5;setCalStep(5);holdMsRef.current=0;bufRef.current=[];
+          cRightLim.current=Math.max.apply(null,bufRef.current);
+          say("Вижу, ты у правой. Записал правый край."); calStepRef.current=5;setCalStep(5);holdMsRef.current=0;bufRef.current=[];
         }
       }
       else if(step===5){ // возврат в центр
@@ -252,12 +246,17 @@ function LaneTest({vol,setScreen}){
       else if(step===4)setMsg("Прижмитесь к ПРАВОЙ линии (зеркало!) → ("+Math.min(100,Math.round(holdMsRef.current/HOLD_SIDE*100))+"%)");
       else if(step===6)setMsg("✓ Калибровка окончена. Нажмите СТАРТ.");
 
-      // ---- контроль (step 7) ----
+      // ---- контроль (step 7): коридор по позиции ЛЕВОЙ линии ----
       let stage=0,side="";
-      if(step===7){
-        if(lX!=null&&cLeftLim.current!=null){ if(lX>=cLeftLim.current-0.015){stage=2;side="L";} else if(lX>=cLeftLim.current-0.05){stage=1;side="L";} }
-        if(rX!=null&&cRightLim.current!=null){ if(rX<=cRightLim.current+0.015){stage=2;side="R";} else if(rX<=cRightLim.current+0.05&&stage<1){stage=1;side="R";} }
+      if(step===7 && lX!=null && cLeftLim.current!=null && cRightLim.current!=null){
+        const lim=cLeftLim.current, rim=cRightLim.current;
+        const margin=(rim-lim)*0.12;
+        if(lX<=lim+margin){ stage=2; side="L"; }
+        else if(lX>=rim-margin){ stage=2; side="R"; }
+        else if(lX<=lim+margin*2){ stage=1; side="L"; }
+        else if(lX>=rim-margin*2){ stage=1; side="R"; }
       }
+      if(stage===0 && alarmRef.current){ alarmRef.current=false; setAlarm(false); }
       if(stage>=2&&!alarmRef.current){alarmRef.current=true;setAlarm(true);beep(950,200,vol*0.7);setTimeout(()=>beep(950,200,vol*0.7),240);}
       else if(stage===1&&!alarmRef.current){beep(820,110,vol*0.45);}
       else if(stage===0&&alarmRef.current){alarmRef.current=false;setAlarm(false);}
