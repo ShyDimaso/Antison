@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v15";
+const VER="v16";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -102,17 +102,30 @@ function siren(times,vol){
    Касание края -> короткий мягкий сигнал 1 сек. Тревога гаснет.
    Всё меряется по центру полосы mid=(левая+правая)/2.
    ============================================================ */
+/* ============================================================
+   ANTISON — ТЕСТ ПОЛОСЫ v16
+   ДВЕ НЕЗАВИСИМЫЕ ЛИНИИ. Обе одинаково важны (слева встречка,
+   справа съезд/пропасть). За каждой следим отдельно.
+   Калибровка (каждый замер 20 сек, усредняем):
+     1) центр  -> где левая (cLc) и правая (cRc) при езде по центру
+     2) к левой -> куда левая доходит когда прижат (cLlim)
+     3) к правой-> куда правая доходит когда прижат (cRlim)
+   Контроль: левая линия дошла до своего предела ИЛИ правая до
+   своего -> сигнал. Линия пропала (съезд/гармошка) -> по той
+   стороне молчим, держим последнее положение пару кадров.
+   Сигнал только при РЕАЛЬНОМ наезде (не приближении).
+   ============================================================ */
 function LaneTest({vol,setScreen}){
   const [phase,setPhase]=React.useState("init");
   const [err,setErr]=React.useState("");
   const [leftX,setLeftX]=React.useState(null);
   const [rightX,setRightX]=React.useState(null);
   const [alarm,setAlarm]=React.useState(false);
+  const [alarmSide,setAlarmSide]=React.useState("");
   const [recN,setRecN]=React.useState(0);
   const [spd,setSpd]=React.useState(null);
   const [clock,setClock]=React.useState("");
-  // step: 0 покой, 1 центр, 2 левая, 3 правая, 4 готово-ждём-старт, 5 контроль
-  const [calStep,setCalStep]=React.useState(0);
+  const [calStep,setCalStep]=React.useState(0); // 0 покой,1 центр,2 левая,3 правая,4 ждём старт,5 контроль
   const [secLeft,setSecLeft]=React.useState(0);
   const [msg,setMsg]=React.useState("Выедь на прямой участок и нажми «Калибровка»");
 
@@ -122,14 +135,17 @@ function LaneTest({vol,setScreen}){
   const alarmRef=React.useRef(false);
   const leftXRef=React.useRef(null),rightXRef=React.useRef(null);
   const lMissRef=React.useRef(0),rMissRef=React.useRef(0);
-  const mCenter=React.useRef(null),mLeft=React.useRef(null),mRight=React.useRef(null); // усреднённые mid
+  // калибровка: центр каждой линии + предел каждой
+  const cLc=React.useRef(null),cRc=React.useRef(null);     // центр: левая, правая
+  const cLlim=React.useRef(null),cRlim=React.useRef(null); // предел: левая (прижат влево), правая (прижат вправо)
   const calStepRef=React.useRef(0);
-  const stepEndRef=React.useRef(0);   // время окончания 20-сек замера
-  const bufRef=React.useRef([]);
+  const stepEndRef=React.useRef(0);
+  const bufL=React.useRef([]),bufR=React.useRef([]);
   const spokeRef=React.useRef(-1);
   const AW=96,AH=72;
   const Z0=Math.floor(AH*0.60);
-  const MEASURE_MS=20000; // 20 секунд на каждый замер
+  const MEASURE_MS=20000;
+  const HOLD_LOST=6; // сколько кадров держим пропавшую линию
 
   const say=(t)=>{try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang="ru-RU";u.rate=1.0;speechSynthesis.speak(u);}catch(e){}};
   const warm=()=>{try{const u=new SpeechSynthesisUtterance(" ");u.volume=0;speechSynthesis.speak(u);}catch(e){}};
@@ -166,10 +182,11 @@ function LaneTest({vol,setScreen}){
     return {lX:bestL>=0?bestL/W:null,rX:bestR>=0?bestR/W:null,sm,need};
   };
 
-  const beginStep=(st)=>{ calStepRef.current=st;setCalStep(st);stepEndRef.current=Date.now()+MEASURE_MS;bufRef.current=[]; };
-  const startCalib=()=>{ warm(); spokeRef.current=-1; beginStep(1); };
+  const beginStep=(st)=>{calStepRef.current=st;setCalStep(st);stepEndRef.current=Date.now()+MEASURE_MS;bufL.current=[];bufR.current=[];};
+  const startCalib=()=>{warm();spokeRef.current=-1;beginStep(1);};
   const cancelCalib=()=>{calStepRef.current=0;setCalStep(0);setMsg("Калибровка сброшена");say("Калибровка сброшена");};
-  const pressStart=()=>{calStepRef.current=5;setCalStep(5);setMsg("✓ Контроль включён");say("Контроль полосы включён. Удачи на дороге. Устал — остановись и поспи.");};
+  const pressStart=()=>{calStepRef.current=5;setCalStep(5);setMsg("✓ Контроль включён");say("Контроль полосы включён. Держись в центре. Устал — остановись и поспи.");};
+  const avg=(a)=>{const f=a.filter(x=>x!=null);return f.length?f.reduce((x,y)=>x+y,0)/f.length:null;};
 
   const loop=()=>{
     const v=videoRef.current,raw=rawRef.current;
@@ -181,52 +198,57 @@ function LaneTest({vol,setScreen}){
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
       let res={lX:null,rX:null,sm:null,need:0};
       if(img)res=detect(img);
-      if(res.lX!=null){leftXRef.current=leftXRef.current==null?res.lX:leftXRef.current*0.7+res.lX*0.3;lMissRef.current=0;}else{lMissRef.current++;if(lMissRef.current>8)leftXRef.current=null;}
-      if(res.rX!=null){rightXRef.current=rightXRef.current==null?res.rX:rightXRef.current*0.7+res.rX*0.3;rMissRef.current=0;}else{rMissRef.current++;if(rMissRef.current>8)rightXRef.current=null;}
+      // сглаживание + удержание пропавшей линии на HOLD_LOST кадров
+      if(res.lX!=null){leftXRef.current=leftXRef.current==null?res.lX:leftXRef.current*0.7+res.lX*0.3;lMissRef.current=0;}
+      else{lMissRef.current++;if(lMissRef.current>HOLD_LOST)leftXRef.current=null;}
+      if(res.rX!=null){rightXRef.current=rightXRef.current==null?res.rX:rightXRef.current*0.7+res.rX*0.3;rMissRef.current=0;}
+      else{rMissRef.current++;if(rMissRef.current>HOLD_LOST)rightXRef.current=null;}
       setLeftX(leftXRef.current);setRightX(rightXRef.current);
       const lX=leftXRef.current,rX=rightXRef.current;
-      const mid=(lX!=null&&rX!=null)?(lX+rX)/2:null;
       const step=calStepRef.current;
 
-      // голос при входе в шаг (один раз)
       if(step!==spokeRef.current && step>=1 && step<=4){
         spokeRef.current=step;
-        if(step===1) say("Едь ровно по центру полосы двадцать секунд. Я запоминаю.");
+        if(step===1) say("Едь ровно по центру полосы двадцать секунд. Я запоминаю обе линии.");
         if(step===2) say("Теперь прижмись к левой линии и двадцать секунд едь вдоль неё. Смотри в левое зеркало, близко, но не наезжай.");
         if(step===3) say("Теперь прижмись к правой линии и едь вдоль неё двадцать секунд. Смотри в правое зеркало.");
-        if(step===4) say("Готово. Я всё запомнил. Нажми Старт, чтобы включить контроль полосы.");
+        if(step===4) say("Готово. Обе линии записаны. Нажми Старт, чтобы включить контроль.");
       }
 
-      // ЗАМЕР: копим mid, ведём обратный отсчёт
+      // ЗАМЕРЫ
       if(step>=1 && step<=3){
-        if(mid!=null) bufRef.current.push(mid);
-        const remain=Math.max(0,stepEndRef.current-now);
-        setSecLeft(Math.ceil(remain/1000));
+        if(lX!=null) bufL.current.push(lX);
+        if(rX!=null) bufR.current.push(rX);
+        const remain=Math.max(0,stepEndRef.current-now); setSecLeft(Math.ceil(remain/1000));
         if(remain<=0){
-          const arr=bufRef.current.filter(x=>x!=null);
-          const avg=arr.length? arr.reduce((a,b)=>a+b,0)/arr.length : null;
-          if(step===1){ mCenter.current=avg; say("Центр записан."); beginStep(2); }
-          else if(step===2){ mLeft.current=avg; say("Левый край записан."); beginStep(3); }
-          else if(step===3){ mRight.current=avg; say("Правый край записан."); calStepRef.current=4;setCalStep(4); }
+          if(step===1){ cLc.current=avg(bufL.current); cRc.current=avg(bufR.current); say("Центр записан."); beginStep(2); }
+          else if(step===2){ cLlim.current=avg(bufL.current); say("Левый край записан."); beginStep(3); }
+          else if(step===3){ cRlim.current=avg(bufR.current); say("Правый край записан."); calStepRef.current=4;setCalStep(4); }
         }
       }
 
-      // статус-текст
       if(step===1) setMsg("Едь ПО ЦЕНТРУ: "+secLeft+" сек");
       else if(step===2) setMsg("← Прижмись к ЛЕВОЙ (зеркало): "+secLeft+" сек");
       else if(step===3) setMsg("Прижмись к ПРАВОЙ (зеркало) →: "+secLeft+" сек");
       else if(step===4) setMsg("✓ Калибровка готова. Нажми СТАРТ.");
 
-      // КОНТРОЛЬ: коридор ровно между mLeft и mRight
-      let stage=0;
-      if(step===5 && mid!=null && mLeft.current!=null && mRight.current!=null){
-        // mLeft = mid когда прижат к левой; mRight = mid когда прижат к правой
-        const lo=Math.min(mLeft.current,mRight.current), hi=Math.max(mLeft.current,mRight.current);
-        // касание края коридора -> сигнал. небольшой запас внутрь (5% ширины).
-        const pad=(hi-lo)*0.05;
-        if(mid<=lo+pad || mid>=hi-pad) stage=1;
+      // ---- КОНТРОЛЬ: две независимые линии ----
+      let stage=0,sideTxt="";
+      if(step===5){
+        // ЛЕВАЯ: от центра cLc линия при прижатии идёт к cLlim. наехал = дошёл до cLlim (с запасом внутрь)
+        if(lX!=null && cLc.current!=null && cLlim.current!=null){
+          const dir=Math.sign(cLlim.current-cLc.current)||1; // куда движется левая при прижатии
+          const reach=cLlim.current - dir*Math.abs(cLlim.current-cLc.current)*0.10; // порог у самого предела
+          if(dir>0 ? lX>=reach : lX<=reach){ stage=2; sideTxt="ЛЕВАЯ"; }
+        }
+        // ПРАВАЯ независимо
+        if(rX!=null && cRc.current!=null && cRlim.current!=null){
+          const dir=Math.sign(cRlim.current-cRc.current)||1;
+          const reach=cRlim.current - dir*Math.abs(cRlim.current-cRc.current)*0.10;
+          if(dir>0 ? rX>=reach : rX<=reach){ stage=2; sideTxt=sideTxt?"ОБЕ":"ПРАВАЯ"; }
+        }
       }
-      if(stage===1 && !alarmRef.current){ alarmRef.current=true; setAlarm(true); beep(760,900,vol*0.4); setTimeout(()=>{alarmRef.current&&setAlarm(false);},1100); }
+      if(stage>=2 && !alarmRef.current){ alarmRef.current=true; setAlarm(true); setAlarmSide(sideTxt); beep(780,850,vol*0.45); setTimeout(()=>{alarmRef.current&&setAlarm(false);},950); }
       else if(stage===0 && alarmRef.current){ alarmRef.current=false; setAlarm(false); }
 
       // HUD
@@ -239,20 +261,19 @@ function LaneTest({vol,setScreen}){
         if(res.sm){const sx=VW/AW;for(let x=0;x<AW;x++){if(res.sm[x]>=res.need){vc.fillStyle="rgba(0,232,255,0.4)";vc.fillRect(x*sx,zy,sx,VH-zy);}}}
         if(lX!=null){const px=lX*VW;vc.strokeStyle="#ffd23f";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
         if(rX!=null){const px=rX*VW;vc.strokeStyle="#fff";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
-        // коридор (mLeft..mRight) зелёные границы + текущий mid
-        if(mLeft.current!=null){const px=mLeft.current*VW;vc.strokeStyle="rgba(0,232,122,0.8)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
-        if(mRight.current!=null){const px=mRight.current*VW;vc.strokeStyle="rgba(0,232,122,0.8)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
-        if(mid!=null){const px=mid*VW;vc.strokeStyle="#ff6b35";vc.lineWidth=3;vc.beginPath();vc.moveTo(px,zy+4);vc.lineTo(px,VH-4);vc.stroke();}
+        // пределы (красные) — левый и правый
+        if(cLlim.current!=null){const px=cLlim.current*VW;vc.strokeStyle="rgba(255,80,80,0.85)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
+        if(cRlim.current!=null){const px=cRlim.current*VW;vc.strokeStyle="rgba(255,80,80,0.85)";vc.setLineDash([5,4]);vc.lineWidth=2;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();vc.setLineDash([]);}
       }
 
-      logRef.current.push({t:now-startTsRef.current,lX:lX!=null?+lX.toFixed(3):null,rX:rX!=null?+rX.toFixed(3):null,mid:mid!=null?+mid.toFixed(3):null,step,mC:mCenter.current,mL:mLeft.current,mR:mRight.current,stage});
+      logRef.current.push({t:now-startTsRef.current,lX:lX!=null?+lX.toFixed(3):null,rX:rX!=null?+rX.toFixed(3):null,step,cLc:cLc.current,cRc:cRc.current,cLlim:cLlim.current,cRlim:cRlim.current,stage,side:sideTxt});
       setRecN(logRef.current.length);
     }
     rafRef.current=requestAnimationFrame(()=>setTimeout(loop,90));
   };
 
   const download=()=>{
-    const out={meta:{app:"Antison-LaneTest",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,mCenter:mCenter.current,mLeft:mLeft.current,mRight:mRight.current,samples:logRef.current.length},rows:logRef.current};
+    const out={meta:{app:"Antison-LaneTest",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,cLc:cLc.current,cRc:cRc.current,cLlim:cLlim.current,cRlim:cRlim.current,samples:logRef.current.length},rows:logRef.current};
     const blob=new Blob([JSON.stringify(out,null,1)],{type:"application/json"});
     const url=URL.createObjectURL(blob),a=document.createElement("a");
     a.href=url;a.download="antison_lane_"+new Date().toISOString().replace(/[:.]/g,"-")+".json";
@@ -268,7 +289,7 @@ function LaneTest({vol,setScreen}){
     </div>
   );
 
-  const stepColor=calStep===5?"#00e87a":calStep===4?"#00e87a":calStep>0?"#ffd23f":"#8a9bb0";
+  const stepColor=calStep>=4?"#00e87a":calStep>0?"#ffd23f":"#8a9bb0";
 
   return (
    <React.Fragment>
@@ -280,7 +301,8 @@ function LaneTest({vol,setScreen}){
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
             <span className="mono" style={{fontSize:"19px",fontWeight:900,color:"#fff"}}>ПОЛОСА {VER}</span>
-            <span style={{fontSize:"13px",fontWeight:800,marginLeft:"8px",color:(leftX!=null||rightX!=null)?"#00e87a":"#ffb84a"}}>{(leftX!=null||rightX!=null)?"✓ линии":"⋯ ищу"}</span>
+            <span style={{fontSize:"13px",fontWeight:800,marginLeft:"8px",color:(leftX!=null?"#ffd23f":"#556")}}>L</span>
+            <span style={{fontSize:"13px",fontWeight:800,marginLeft:"4px",color:(rightX!=null?"#fff":"#556")}}>R</span>
           </div>
           <div className="mono" style={{fontSize:"15px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"} mph · {clock}</div>
         </div>
@@ -297,7 +319,7 @@ function LaneTest({vol,setScreen}){
             <button onClick={pressStart} style={{width:"100%",padding:"16px",borderRadius:"12px",fontSize:"18px",fontWeight:900,border:"1px solid #00e87a",background:"linear-gradient(135deg,#0f401b,#1c6e32)",color:"#8cffbe"}}>▶ СТАРТ — включить контроль</button>
           )}
           {calStep===5&&(
-            <button onClick={()=>{calStepRef.current=0;setCalStep(0);mCenter.current=mLeft.current=mRight.current=null;setMsg("Нажми «Калибровка»");}} style={{width:"100%",padding:"12px",borderRadius:"11px",fontSize:"14px",fontWeight:700,border:"1px solid rgba(255,210,63,0.5)",background:"rgba(255,210,63,0.12)",color:"#ffd23f"}}>↺ Перекалибровать</button>
+            <button onClick={()=>{calStepRef.current=0;setCalStep(0);cLc.current=cRc.current=cLlim.current=cRlim.current=null;setMsg("Нажми «Калибровка»");}} style={{width:"100%",padding:"12px",borderRadius:"11px",fontSize:"14px",fontWeight:700,border:"1px solid rgba(255,210,63,0.5)",background:"rgba(255,210,63,0.12)",color:"#ffd23f"}}>↺ Перекалибровать</button>
           )}
           <div style={{display:"flex",gap:"8px",marginTop:"8px"}}>
             <button onClick={download} style={{flex:1,padding:"12px",borderRadius:"11px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог:{recN}</button>
@@ -308,7 +330,7 @@ function LaneTest({vol,setScreen}){
 
       <div style={{flex:1,position:"relative",padding:"8px",display:"flex",alignItems:"center",justifyContent:"center"}}>
         <canvas ref={viewRef} width={320} height={240} style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
-        {alarm&&<div style={{position:"absolute",background:"rgba(150,90,0,0.8)",color:"#fff",fontSize:"24px",fontWeight:900,padding:"12px 20px",borderRadius:"14px"}}>⚠ у края полосы</div>}
+        {alarm&&<div style={{position:"absolute",background:"rgba(160,40,0,0.85)",color:"#fff",fontSize:"24px",fontWeight:900,padding:"12px 20px",borderRadius:"14px"}}>⚠ {alarmSide} ЛИНИЯ</div>}
       </div>
     </div>
    </React.Fragment>
