@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v18";
+const VER="v19";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -232,8 +232,8 @@ function LaneTest({vol,setScreen}){
       if(step!==spokeRef.current && step>=1 && step<=4){
         spokeRef.current=step;
         if(step===1){ sayThen("Едь ровно по центру полосы. Как будешь готов — я начну отсчёт.",()=>armCountdown()); }
-        if(step===2){ sayThen("Теперь прижмись к левой жёлтой линии. Смотри в левое зеркало, подойди максимально близко. Как доедешь — я начну отсчёт.",()=>armCountdown()); }
-        if(step===3){ sayThen("Теперь прижмись к правой белой линии. Смотри в правое зеркало. Как доедешь — я начну отсчёт.",()=>armCountdown()); }
+        if(step===2){ sayThen("Теперь прижмись к левой линии. Смотри в левое зеркало, подойди максимально близко. Как доедешь — я начну отсчёт.",()=>armCountdown()); }
+        if(step===3){ sayThen("Теперь прижмись к правой линии. Смотри в правое зеркало. Как доедешь — я начну отсчёт.",()=>armCountdown()); }
         if(step===4) say("Готово. Обе линии записаны. Нажми Старт, чтобы включить контроль.");
       }
 
@@ -257,30 +257,28 @@ function LaneTest({vol,setScreen}){
           measuringRef.current=false; setMeasuring(false);
           const nL=bufL.current.length, nR=bufR.current.length;
           const MIN=40; // минимум кадров с линией, иначе замер не годится
-          const MINSHIFT=0.05; // предел должен отличаться от центра хотя бы на столько
+          // ЗАПИСЫВАЕМ ТО, ЧТО ПРОЕХАЛ. С первого раза.
           if(step===1){
-            if(nL<MIN && nR<MIN){ say("Не вижу разметку. Повторяю замер."); beginStep(1); }
-            else { cLc.current=modeZone(bufL.current); cRc.current=modeZone(bufR.current); say("Центр записан. Отбой."); beginStep(2); }
+            cLc.current=modeZone(bufL.current); cRc.current=modeZone(bufR.current);
+            say("Центр записан. Отбой."); beginStep(2);
           }
           else if(step===2){
             const val=modeZone(bufL.current);
-            if(nL<MIN || val==null){ say("Левую линию почти не вижу. Повторяю замер."); beginStep(2); }
-            else if(cLc.current!=null && Math.abs(val-cLc.current)<MINSHIFT){ say("Ты почти не сместился. Подойди ближе к левой линии. Повторяю."); beginStep(2); }
-            else { cLlim.current=val; say("Левый край записан. Отбой."); beginStep(3); }
+            cLlim.current=(val!=null?val:cLc.current);
+            say("Левый край записан. Отбой."); beginStep(3);
           }
           else if(step===3){
             const val=modeZone(bufR.current);
-            if(nR<MIN || val==null){ say("Правую линию почти не вижу. Повторяю замер."); beginStep(3); }
-            else if(cRc.current!=null && Math.abs(val-cRc.current)<MINSHIFT){ say("Ты почти не сместился. Подойди ближе к правой линии. Повторяю."); beginStep(3); }
-            else { cRlim.current=val; say("Правый край записан. Отбой."); calStepRef.current=4;setCalStep(4); }
+            cRlim.current=(val!=null?val:cRc.current);
+            say("Правый край записан. Отбой."); calStepRef.current=4;setCalStep(4);
           }
         }
       }
 
       const ph = measuringRef.current ? ("ЗАМЕР · "+secLeft+" сек") : (cdRef.current>0? ("готовься: "+cdRef.current) : "доезжай до линии…");
       if(step===1) setMsg("Едь ПО ЦЕНТРУ · "+ph+" · L:"+bufL.current.length+" R:"+bufR.current.length);
-      else if(step===2) setMsg("← ЛЕВАЯ жёлтая (зеркало) · "+ph+" · L:"+bufL.current.length);
-      else if(step===3) setMsg("ПРАВАЯ белая (зеркало) → · "+ph+" · R:"+bufR.current.length);
+      else if(step===2) setMsg("← ЛЕВАЯ линия (зеркало) · "+ph+" · L:"+bufL.current.length);
+      else if(step===3) setMsg("ПРАВАЯ линия (зеркало) → · "+ph+" · R:"+bufR.current.length);
       else if(step===4) setMsg("✓ Калибровка готова. Нажми СТАРТ.");
 
       // ---- КОНТРОЛЬ: две независимые линии ----
@@ -355,8 +353,8 @@ function LaneTest({vol,setScreen}){
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
           <div>
             <span className="mono" style={{fontSize:"19px",fontWeight:900,color:"#fff"}}>ПОЛОСА {VER}</span>
-            <span style={{fontSize:"13px",fontWeight:800,marginLeft:"8px",color:(leftX!=null?"#ffd23f":"#556")}}>L</span>
-            <span style={{fontSize:"13px",fontWeight:800,marginLeft:"4px",color:(rightX!=null?"#fff":"#556")}}>R</span>
+            <span style={{fontSize:"15px",fontWeight:900,marginLeft:"10px",padding:"3px 8px",borderRadius:"7px",background:leftX!=null?"rgba(255,210,63,0.25)":"rgba(90,90,90,0.2)",color:leftX!=null?"#ffd23f":"#667"}}>{leftX!=null?"◀ ЛЕВУЮ ВИЖУ":"◀ нет"}</span>
+            <span style={{fontSize:"15px",fontWeight:900,marginLeft:"6px",padding:"3px 8px",borderRadius:"7px",background:rightX!=null?"rgba(255,255,255,0.22)":"rgba(90,90,90,0.2)",color:rightX!=null?"#fff":"#667"}}>{rightX!=null?"ПРАВУЮ ВИЖУ ▶":"нет ▶"}</span>
           </div>
           <div className="mono" style={{fontSize:"15px",fontWeight:800,color:"#f0f4f8"}}>{spd!=null?spd:"--"} mph · {clock}</div>
         </div>
