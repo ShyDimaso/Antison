@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v21";
+const VER="v22";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -129,6 +129,7 @@ function LaneTest({vol,setScreen}){
   const [secLeft,setSecLeft]=React.useState(0);
   const [cdShow,setCdShow]=React.useState(0);
   const [measuring,setMeasuring]=React.useState(false);
+  const [shotsN,setShotsN]=React.useState(0);
   const [msg,setMsg]=React.useState("Выедь на прямой участок и нажми «Калибровка»");
 
   const videoRef=React.useRef(null),rawRef=React.useRef(null),viewRef=React.useRef(null);
@@ -147,9 +148,11 @@ function LaneTest({vol,setScreen}){
   const cdRef=React.useRef(0),cdNextRef=React.useRef(0);
   const measuringRef=React.useRef(false);
   const onLineMsRef=React.useRef(0);
+  const shotsRef=React.useRef([]);      // снимки: {code,dataUrl}
+  const shotWantRef=React.useRef(null); // какой снимок сделать на след. кадре
   const AW=96,AH=72;
   const Z_FAR=Math.floor(AH*0.50);   // дальняя часть: смотрим для подтверждения линии
-  const Z_NEAR=Math.floor(AH*0.80);  // БЛИЖНЯЯ у капота: по ней меряем съезд с полосы
+  const Z_NEAR=Math.floor(AH*0.65);  // БЛИЖНЯЯ у капота: по ней меряем съезд с полосы
   const Z0=Z_FAR;
   const MEASURE_MS=20000;
   const HOLD_LOST=10; // сколько кадров держим пропавшую линию
@@ -193,7 +196,7 @@ function LaneTest({vol,setScreen}){
       }
     }
     const zoneH=H-Z_NEAR;const colVote=voteNear;
-    const need=Math.max(2,zoneH*0.30);const sm=new Float32Array(W);
+    const need=Math.max(2,zoneH*0.15);const sm=new Float32Array(W);
     for(let x=1;x<W-1;x++)sm[x]=colVote[x-1]*0.5+colVote[x]+colVote[x+1]*0.5;
     // собираем ВСЕ пики-линии (локальные максимумы выше порога)
     const peaks=[];
@@ -219,6 +222,27 @@ function LaneTest({vol,setScreen}){
   const startCalib=()=>{warm();spokeRef.current=-1;beginStep(1);};
   const cancelCalib=()=>{calStepRef.current=0;setCalStep(0);setMsg("Калибровка сброшена");say("Калибровка сброшена");};
   const pressStart=()=>{calStepRef.current=5;setCalStep(5);setMsg("✓ Контроль включён");say("Контроль полосы включён. Держись в центре. Устал — остановись и поспи.");};
+  // снимок кадра с подписью-кодом (чтобы понимать, к чему относится)
+  const grabShot=(code,info)=>{
+    try{
+      const v=videoRef.current; if(!v||v.readyState<2) return;
+      const c=document.createElement("canvas"); c.width=480;c.height=360;
+      const ctx=c.getContext("2d"); ctx.drawImage(v,0,0,c.width,c.height);
+      // линии зон
+      const yF=Z_FAR/AH*c.height, yN=Z_NEAR/AH*c.height;
+      ctx.strokeStyle="rgba(74,158,255,0.8)";ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,yF);ctx.lineTo(c.width,yF);ctx.stroke();
+      ctx.strokeStyle="rgba(0,232,122,0.95)";ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(0,yN);ctx.lineTo(c.width,yN);ctx.stroke();
+      // найденные линии
+      if(leftXRef.current!=null){const px=leftXRef.current*c.width;ctx.strokeStyle="#ffd23f";ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(px,yF);ctx.lineTo(px,c.height);ctx.stroke();}
+      if(rightXRef.current!=null){const px=rightXRef.current*c.width;ctx.strokeStyle="#ffffff";ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(px,yF);ctx.lineTo(px,c.height);ctx.stroke();}
+      // подпись-код
+      ctx.fillStyle="rgba(0,0,0,0.75)";ctx.fillRect(0,0,c.width,44);
+      ctx.fillStyle="#fff";ctx.font="bold 20px sans-serif";ctx.fillText(code,8,26);
+      ctx.font="13px monospace";ctx.fillStyle="#9fcfff";ctx.fillText(info||"",8,40);
+      shotsRef.current.push({code:code,dataUrl:c.toDataURL("image/jpeg",0.7)});
+      setShotsN(shotsRef.current.length);
+    }catch(e){}
+  };
   const avg=(a)=>{const f=a.filter(x=>x!=null);return f.length?f.reduce((x,y)=>x+y,0)/f.length:null;};
   // зона, где водитель ДОЛЬШЕ ВСЕГО держался: строим гистограмму и берём её пик
   const modeZone=(a)=>{
@@ -308,16 +332,19 @@ function LaneTest({vol,setScreen}){
           // ЗАПИСЫВАЕМ ТО, ЧТО ПРОЕХАЛ. С первого раза.
           if(step===1){
             cLc.current=modeZone(bufL.current); cRc.current=modeZone(bufR.current);
+            grabShot("1-CENTER (езда по центру)","L="+(cLc.current!=null?cLc.current.toFixed(3):"нет")+" R="+(cRc.current!=null?cRc.current.toFixed(3):"нет")+" кадров L:"+nL+" R:"+nR);
             say("Центр записан. Отбой."); beginStep(2);
           }
           else if(step===2){
             const val=modeZone(bufL.current);
             cLlim.current=(val!=null?val:cLc.current);
+            grabShot("2-LEFT (прижат к левой)","Llim="+(cLlim.current!=null?cLlim.current.toFixed(3):"нет")+" (центр был "+(cLc.current!=null?cLc.current.toFixed(3):"?")+") кадров L:"+nL);
             say("Левый край записан. Отбой."); beginStep(3);
           }
           else if(step===3){
             const val=modeZone(bufR.current);
             cRlim.current=(val!=null?val:cRc.current);
+            grabShot("3-RIGHT (прижат к правой)","Rlim="+(cRlim.current!=null?cRlim.current.toFixed(3):"нет")+" (центр был "+(cRc.current!=null?cRc.current.toFixed(3):"?")+") кадров R:"+nR);
             say("Правый край записан. Отбой."); calStepRef.current=4;setCalStep(4);
           }
         }
@@ -348,7 +375,9 @@ function LaneTest({vol,setScreen}){
       // сигнал только если реально ЗАШЁЛ на линию и держится ~0.5 сек (убирает писки от дрожания)
       if(stage>=2) onLineMsRef.current+=90; else onLineMsRef.current=0;
       const confirmed = onLineMsRef.current>=500;
-      if(confirmed && !alarmRef.current){ alarmRef.current=true; setAlarm(true); setAlarmSide(sideTxt); beep(780,850,vol*0.45); setTimeout(()=>{alarmRef.current&&setAlarm(false);},950); }
+      if(confirmed && !alarmRef.current){ alarmRef.current=true; setAlarm(true); setAlarmSide(sideTxt); beep(780,850,vol*0.45); setTimeout(()=>{alarmRef.current&&setAlarm(false);},950);
+        if(shotsRef.current.length<12 && now-(shotWantRef.current||0)>5000){ shotWantRef.current=now;
+          grabShot("4-ALARM "+sideTxt,"lX="+(lX!=null?lX.toFixed(3):"нет")+" rX="+(rX!=null?rX.toFixed(3):"нет")+" | Llim="+(cLlim.current!=null?cLlim.current.toFixed(3):"?")+" Rlim="+(cRlim.current!=null?cRlim.current.toFixed(3):"?")); } }
       else if(!confirmed && alarmRef.current){ alarmRef.current=false; setAlarm(false); }
 
       // HUD
@@ -374,6 +403,15 @@ function LaneTest({vol,setScreen}){
     rafRef.current=requestAnimationFrame(()=>setTimeout(loop,90));
   };
 
+  const downloadShots=()=>{
+    shotsRef.current.forEach((s,i)=>{
+      setTimeout(()=>{
+        const a=document.createElement("a"); a.href=s.dataUrl;
+        a.download="antison_shot_"+String(i+1).padStart(2,"0")+"_"+s.code.replace(/[^a-zA-Z0-9-]/g,"_")+".jpg";
+        document.body.appendChild(a);a.click();setTimeout(()=>document.body.removeChild(a),300);
+      }, i*500);
+    });
+  };
   const download=()=>{
     const out={meta:{app:"Antison-LaneTest",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,cLc:cLc.current,cRc:cRc.current,cLlim:cLlim.current,cRlim:cRlim.current,samples:logRef.current.length},rows:logRef.current};
     const blob=new Blob([JSON.stringify(out,null,1)],{type:"application/json"});
@@ -430,6 +468,7 @@ function LaneTest({vol,setScreen}){
           )}
           <div style={{display:"flex",gap:"8px",marginTop:"8px"}}>
             <button onClick={download} style={{flex:1,padding:"12px",borderRadius:"11px",fontSize:"13px",fontWeight:700,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(20,24,34,0.9)",color:"#c0c8d4"}}>⬇ Лог:{recN}</button>
+            <button onClick={downloadShots} style={{flex:1,padding:"12px",borderRadius:"11px",fontSize:"13px",fontWeight:700,border:"1px solid #4a9eff",background:"rgba(74,158,255,0.15)",color:"#9fcfff"}}>📷 Фото:{shotsN}</button>
             <button onClick={()=>{stopAll();setScreen("home");}} style={{flex:1.3,padding:"12px",borderRadius:"11px",fontSize:"16px",fontWeight:800,border:"1px solid #ff4444",background:"rgba(255,68,68,0.18)",color:"#ff8888"}}>■ СТОП</button>
           </div>
         </div>
@@ -745,6 +784,15 @@ function Run(p){
   };
 
   const toggleRec=()=>{ recRef.current=!recRef.current; if(recRef.current){logRef.current=[];setRecN(0);} };
+  const downloadShots=()=>{
+    shotsRef.current.forEach((s,i)=>{
+      setTimeout(()=>{
+        const a=document.createElement("a"); a.href=s.dataUrl;
+        a.download="antison_shot_"+String(i+1).padStart(2,"0")+"_"+s.code.replace(/[^a-zA-Z0-9-]/g,"_")+".jpg";
+        document.body.appendChild(a);a.click();setTimeout(()=>document.body.removeChild(a),300);
+      }, i*500);
+    });
+  };
   const download=()=>{
     const out={meta:{app:"Antison",ver:VER,ts:new Date().toISOString(),ua:navigator.userAgent,holdSec:p.holdSec,sens:p.sens,glowColor:p.glowColor,zone:zoneRef.current,samples:logRef.current.length},rows:logRef.current};
     const blob=new Blob([JSON.stringify(out,null,1)],{type:"application/json"});
