@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v22";
+const VER="v23";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -130,6 +130,7 @@ function LaneTest({vol,setScreen}){
   const [cdShow,setCdShow]=React.useState(0);
   const [measuring,setMeasuring]=React.useState(false);
   const [shotsN,setShotsN]=React.useState(0);
+  const [shots,setShots]=React.useState([]);
   const [msg,setMsg]=React.useState("Выедь на прямой участок и нажми «Калибровка»");
 
   const videoRef=React.useRef(null),rawRef=React.useRef(null),viewRef=React.useRef(null);
@@ -148,11 +149,12 @@ function LaneTest({vol,setScreen}){
   const cdRef=React.useRef(0),cdNextRef=React.useRef(0);
   const measuringRef=React.useRef(false);
   const onLineMsRef=React.useRef(0);
+  const lFreshRef=React.useRef(false),rFreshRef=React.useRef(false);
   const shotsRef=React.useRef([]);      // снимки: {code,dataUrl}
   const shotWantRef=React.useRef(null); // какой снимок сделать на след. кадре
   const AW=96,AH=72;
   const Z_FAR=Math.floor(AH*0.50);   // дальняя часть: смотрим для подтверждения линии
-  const Z_NEAR=Math.floor(AH*0.65);  // БЛИЖНЯЯ у капота: по ней меряем съезд с полосы
+  const Z_NEAR=Math.floor(AH*0.58);  // БЛИЖНЯЯ у капота: по ней меряем съезд с полосы
   const Z0=Z_FAR;
   const MEASURE_MS=20000;
   const HOLD_LOST=10; // сколько кадров держим пропавшую линию
@@ -239,8 +241,16 @@ function LaneTest({vol,setScreen}){
       ctx.fillStyle="rgba(0,0,0,0.75)";ctx.fillRect(0,0,c.width,44);
       ctx.fillStyle="#fff";ctx.font="bold 20px sans-serif";ctx.fillText(code,8,26);
       ctx.font="13px monospace";ctx.fillStyle="#9fcfff";ctx.fillText(info||"",8,40);
-      shotsRef.current.push({code:code,dataUrl:c.toDataURL("image/jpeg",0.7)});
+      const url=c.toDataURL("image/jpeg",0.8);
+      shotsRef.current.push({code:code,dataUrl:url});
       setShotsN(shotsRef.current.length);
+      setShots(shotsRef.current.slice(-6));
+      // автосохранение сразу, чтобы не потерялось при выходе
+      try{
+        const a=document.createElement("a"); a.href=url;
+        a.download="antison_shot_"+String(shotsRef.current.length).padStart(2,"0")+"_"+code.replace(/[^a-zA-Z0-9-]/g,"_")+".jpg";
+        document.body.appendChild(a);a.click();setTimeout(()=>{try{document.body.removeChild(a);}catch(e){}},400);
+      }catch(e){}
     }catch(e){}
   };
   const avg=(a)=>{const f=a.filter(x=>x!=null);return f.length?f.reduce((x,y)=>x+y,0)/f.length:null;};
@@ -277,7 +287,7 @@ function LaneTest({vol,setScreen}){
         for(const p of peaks){
           if(exclude!=null && Math.abs(p.x-exclude)<0.03) continue;
           const d=prev==null? 1e8-p.s : Math.abs(p.x-prev);
-          if(prev!=null && d>0.12) continue; // слишком далеко — это другая линия
+          if(prev!=null && d>0.20) continue; // слишком далеко — это другая линия
           if(d<bd){bd=d;best=p.x;}
         }
         return best;
@@ -293,10 +303,10 @@ function LaneTest({vol,setScreen}){
         if(sorted.length>=2){ newL=sorted[0].x; newR=sorted[sorted.length-1].x; }
         else if(sorted.length===1){ if(sorted[0].x<0.5) newL=sorted[0].x; else newR=sorted[0].x; }
       }
-      if(newL!=null){leftXRef.current=prevL==null?newL:prevL*0.7+newL*0.3;lMissRef.current=0;}
-      else{lMissRef.current++;if(lMissRef.current>HOLD_LOST)leftXRef.current=null;}
-      if(newR!=null){rightXRef.current=prevR==null?newR:prevR*0.7+newR*0.3;rMissRef.current=0;}
-      else{rMissRef.current++;if(rMissRef.current>HOLD_LOST)rightXRef.current=null;}
+      if(newL!=null){leftXRef.current=prevL==null?newL:prevL*0.55+newL*0.45;lMissRef.current=0;lFreshRef.current=true;}
+      else{lMissRef.current++;lFreshRef.current=false;if(lMissRef.current>HOLD_LOST)leftXRef.current=null;}
+      if(newR!=null){rightXRef.current=prevR==null?newR:prevR*0.55+newR*0.45;rMissRef.current=0;rFreshRef.current=true;}
+      else{rMissRef.current++;rFreshRef.current=false;if(rMissRef.current>HOLD_LOST)rightXRef.current=null;}
       setLeftX(leftXRef.current);setRightX(rightXRef.current);
       const lX=leftXRef.current,rX=rightXRef.current;
       const step=calStepRef.current;
@@ -474,6 +484,16 @@ function LaneTest({vol,setScreen}){
         </div>
       </div>
 
+      {shots.length>0&&(
+        <div style={{display:"flex",gap:"6px",padding:"6px 8px",overflowX:"auto",background:"rgba(10,13,20,0.9)"}}>
+          {shots.map((s,i)=>(
+            <div key={i} style={{flexShrink:0,textAlign:"center"}}>
+              <img src={s.dataUrl} style={{height:"78px",borderRadius:"7px",border:"1px solid rgba(74,158,255,0.4)",display:"block"}}/>
+              <div className="mono" style={{fontSize:"9px",color:"#8a9bb0",marginTop:"2px",maxWidth:"104px",overflow:"hidden"}}>{s.code}</div>
+            </div>
+          ))}
+        </div>
+      )}
       <div style={{flex:1,position:"relative",padding:"8px",display:"flex",alignItems:"center",justifyContent:"center"}}>
         <canvas ref={viewRef} width={320} height={240} style={{width:"100%",aspectRatio:"4 / 3",borderRadius:"12px",border:"1px solid rgba(74,158,255,0.3)",display:"block",background:"#000"}}/>
         {alarm&&<div style={{position:"absolute",background:"rgba(160,40,0,0.85)",color:"#fff",fontSize:"24px",fontWeight:900,padding:"12px 20px",borderRadius:"14px"}}>⚠ {alarmSide} ЛИНИЯ</div>}
