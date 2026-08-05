@@ -23,7 +23,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
 <script type="text/babel">
 const {useState,useRef,useEffect}=React;
-const VER="v23";
+const VER="v24";
 
 /* ============================================================
    АНТИСОН — автономный детектор засыпания.
@@ -153,9 +153,12 @@ function LaneTest({vol,setScreen}){
   const shotsRef=React.useRef([]);      // снимки: {code,dataUrl}
   const shotWantRef=React.useRef(null); // какой снимок сделать на след. кадре
   const AW=96,AH=72;
-  const Z_FAR=Math.floor(AH*0.50);   // дальняя часть: смотрим для подтверждения линии
-  const Z_NEAR=Math.floor(AH*0.58);  // БЛИЖНЯЯ у капота: по ней меряем съезд с полосы
-  const Z0=Z_FAR;
+  // границы зон вычисляются динамически: снизу торпеда/капот (тёмная неподвижная),
+  // работаем ТОЛЬКО по полосе дороги над ней.
+  const dashTopRef=React.useRef(null);     // строка, где начинается торпеда
+  const zFarRef=React.useRef(Math.floor(AH*0.45));
+  const zNearRef=React.useRef(Math.floor(AH*0.62));
+  const [zoneInfo,setZoneInfo]=React.useState("");
   const MEASURE_MS=20000;
   const HOLD_LOST=10; // сколько кадров держим пропавшую линию
 
@@ -183,21 +186,34 @@ function LaneTest({vol,setScreen}){
   const stopAll=()=>{cancelAnimationFrame(rafRef.current);try{speechSynthesis.cancel();}catch(e){}if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}};
   React.useEffect(()=>{startCam();return()=>stopAll();},[]);
 
+  // ищем верх торпеды: снизу вверх, пока строки тёмные и почти без перепадов
+  const findDashTop=(img)=>{
+    const d=img.data,W=AW,H=AH;
+    let top=H-1;
+    for(let y=H-1;y>=Math.floor(H*0.25);y--){
+      let sum=0,varSum=0,prev=null;
+      for(let x=0;x<W;x++){const i=(y*W+x)*4;const l=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;sum+=l;if(prev!=null)varSum+=Math.abs(l-prev);prev=l;}
+      const mean=sum/W, rough=varSum/W;
+      // торпеда: тёмная И гладкая (мало перепадов)
+      if(mean<95 && rough<5){ top=y; } else { break; }
+    }
+    return top;
+  };
   const detect=(img)=>{
     const d=img.data,W=AW,H=AH;
     const gray=new Float32Array(W*H);
     for(let y=Z0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;gray[y*W+x]=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;}
     const STEP=2,EDGE=4,MAXW=10;
     const voteNear=new Float32Array(W), voteFar=new Float32Array(W);
-    for(let y=Z_FAR;y<H;y++){
-      const near = y>=Z_NEAR;
+    for(let y=ZF;y<YEND;y++){
+      const near = y>=ZN;
       for(let x=STEP;x<W-STEP-MAXW;x++){
         const g=gray[y*W+x+STEP]-gray[y*W+x-STEP];
         if(g>EDGE){ for(let w=2;w<=MAXW;w++){ const g2=gray[y*W+x+w+STEP]-gray[y*W+x+w-STEP];
           if(g2<-EDGE){ const c=x+Math.floor(w/2); if(near) voteNear[c]+=1; else voteFar[c]+=1; break; } } }
       }
     }
-    const zoneH=H-Z_NEAR;const colVote=voteNear;
+    const zoneH=Math.max(1,YEND-ZN);const colVote=voteNear;
     const need=Math.max(2,zoneH*0.15);const sm=new Float32Array(W);
     for(let x=1;x<W-1;x++)sm[x]=colVote[x-1]*0.5+colVote[x]+colVote[x+1]*0.5;
     // собираем ВСЕ пики-линии (локальные максимумы выше порога)
@@ -212,7 +228,7 @@ function LaneTest({vol,setScreen}){
     // дальние пики — подтверждают, что это настоящая линия дороги (тянется вдаль), а не пятно
     const smF=new Float32Array(W);
     for(let x=1;x<W-1;x++) smF[x]=voteFar[x-1]*0.5+voteFar[x]+voteFar[x+1]*0.5;
-    const needF=Math.max(2,(Z_NEAR-Z_FAR)*0.25);
+    const needF=Math.max(2,(ZN-ZF)*0.25);
     const farPeaks=[];
     for(let x=2;x<W-2;x++){ if(smF[x]<needF) continue; if(smF[x]>=smF[x-1]&&smF[x]>=smF[x+1]) farPeaks.push(x/W); }
     return {peaks:peaks.map(p=>({x:p.x/W,s:p.s})), farPeaks, sm, need};
@@ -231,9 +247,11 @@ function LaneTest({vol,setScreen}){
       const c=document.createElement("canvas"); c.width=480;c.height=360;
       const ctx=c.getContext("2d"); ctx.drawImage(v,0,0,c.width,c.height);
       // линии зон
-      const yF=Z_FAR/AH*c.height, yN=Z_NEAR/AH*c.height;
+      const yF=zFarRef.current/AH*c.height, yN=zNearRef.current/AH*c.height, yD=(dashTopRef.current!=null?dashTopRef.current:AH)/AH*c.height;
       ctx.strokeStyle="rgba(74,158,255,0.8)";ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,yF);ctx.lineTo(c.width,yF);ctx.stroke();
       ctx.strokeStyle="rgba(0,232,122,0.95)";ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(0,yN);ctx.lineTo(c.width,yN);ctx.stroke();
+      ctx.strokeStyle="rgba(255,80,80,0.9)";ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,yD);ctx.lineTo(c.width,yD);ctx.stroke();
+      ctx.fillStyle="rgba(255,80,80,0.95)";ctx.font="bold 12px sans-serif";ctx.fillText("торпеда ↓",6,yD-4);
       // найденные линии
       if(leftXRef.current!=null){const px=leftXRef.current*c.width;ctx.strokeStyle="#ffd23f";ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(px,yF);ctx.lineTo(px,c.height);ctx.stroke();}
       if(rightXRef.current!=null){const px=rightXRef.current*c.width;ctx.strokeStyle="#ffffff";ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(px,yF);ctx.lineTo(px,c.height);ctx.stroke();}
@@ -276,6 +294,17 @@ function LaneTest({vol,setScreen}){
       const rc=raw.getContext("2d",{willReadFrequently:true});
       rc.drawImage(v,0,0,AW,AH);
       let img=null;try{img=rc.getImageData(0,0,AW,AH);}catch(e){}
+      if(img){
+        // раз в ~1 сек ищем верх торпеды и пересчитываем рабочие зоны
+        if(!dashTopRef.current || (now%1000)<95){
+          const dt=findDashTop(img);
+          dashTopRef.current=dt;
+          const roadH=dt; // дорога занимает строки 0..dt
+          zNearRef.current=Math.max(2,Math.floor(dt-Math.max(4,roadH*0.14))); // узкая полоса прямо над торпедой
+          zFarRef.current=Math.max(1,Math.floor(dt-Math.max(8,roadH*0.35)));  // выше — дальняя часть
+          setZoneInfo("дорога до строки "+dt+"/"+AH+" · контроль "+zNearRef.current+"-"+dt);
+        }
+      }
       let res={peaks:[],sm:null,need:0};
       if(img)res=detect(img);
       const peaks=res.peaks||[];
@@ -395,10 +424,11 @@ function LaneTest({vol,setScreen}){
       if(view){
         const vc=view.getContext("2d"),VW=view.width,VH=view.height;
         vc.drawImage(v,0,0,VW,VH);
-        const zy=Z_FAR/AH*VH, zyN=Z_NEAR/AH*VH;
+        const zy=zFarRef.current/AH*VH, zyN=zNearRef.current/AH*VH, zyD=(dashTopRef.current!=null?dashTopRef.current:AH)/AH*VH;
         vc.strokeStyle="rgba(74,158,255,0.35)";vc.lineWidth=1;vc.beginPath();vc.moveTo(0,zy);vc.lineTo(VW,zy);vc.stroke();
         vc.strokeStyle="rgba(0,232,122,0.85)";vc.lineWidth=2;vc.beginPath();vc.moveTo(0,zyN);vc.lineTo(VW,zyN);vc.stroke();
         vc.fillStyle="rgba(0,232,122,0.9)";vc.font="bold 11px sans-serif";vc.fillText("контроль здесь ↓",6,zyN-5);
+        vc.strokeStyle="rgba(255,80,80,0.8)";vc.lineWidth=2;vc.beginPath();vc.moveTo(0,zyD);vc.lineTo(VW,zyD);vc.stroke();
         if(res.sm){const sx=VW/AW;for(let x=0;x<AW;x++){if(res.sm[x]>=res.need){vc.fillStyle="rgba(0,232,255,0.4)";vc.fillRect(x*sx,zy,sx,VH-zy);}}}
         if(lX!=null){const px=lX*VW;vc.strokeStyle="#ffd23f";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
         if(rX!=null){const px=rX*VW;vc.strokeStyle="#fff";vc.lineWidth=4;vc.beginPath();vc.moveTo(px,zy);vc.lineTo(px,VH);vc.stroke();}
