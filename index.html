@@ -202,7 +202,8 @@ function LaneTest({vol,setScreen}){
   const detect=(img)=>{
     const d=img.data,W=AW,H=AH;
     const gray=new Float32Array(W*H);
-    for(let y=Z0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;gray[y*W+x]=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;}
+    const ZF=zFarRef.current, ZN=zNearRef.current, YEND=(dashTopRef.current!=null?dashTopRef.current:H);
+    for(let y=ZF;y<YEND;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;gray[y*W+x]=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;}
     const STEP=2,EDGE=4,MAXW=10;
     const voteNear=new Float32Array(W), voteFar=new Float32Array(W);
     for(let y=ZF;y<YEND;y++){
